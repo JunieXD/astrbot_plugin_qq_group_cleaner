@@ -87,7 +87,7 @@ def test_instance_lock_excludes_second_owner_and_releases(tmp_path):
     InstanceLock(path).close()
 
 
-def test_log_rotation_age_dedup_close_and_failure(tmp_path):
+def test_log_rotation_age_close_and_failure(tmp_path):
     journal = Journal(tmp_path)
     journal.handler.maxBytes = 120
     for i in range(30):
@@ -98,9 +98,6 @@ def test_log_rotation_age_dedup_close_and_failure(tmp_path):
     os.utime(archive, (time.time() - 15 * 86400,) * 2)
     journal.maintain()
     assert not archive.exists()
-    journal.record("same", "message")
-    journal.record("same", "message")
-    assert journal.last[("same", "message")][1] == 1
     journal.handler.handleError(None)
     with pytest.raises(CleanerError, match="日志"):
         journal.check()

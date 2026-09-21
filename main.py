@@ -11,12 +11,12 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .qq_group_cleaner.commands import Commands
 from .qq_group_cleaner.config import CleanerError, parse_settings
 from .qq_group_cleaner.platform import Router
-from .qq_group_cleaner.resources import InstanceLock, Journal
+from .qq_group_cleaner.resources import InstanceLock, Journal, exception_detail
 from .qq_group_cleaner.service import CleanerService
 from .qq_group_cleaner.store import Store
 
 
-@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.2.2")
+@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.2.3")
 class QQGroupCleaner(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context=context, config=config)
@@ -36,29 +36,39 @@ class QQGroupCleaner(Star):
             root = StarTools.get_data_dir("astrbot_plugin_qq_group_cleaner")
             self.lock = InstanceLock(root / "instance.lock")
             self.journal = Journal(root)
-            self.store = Store(root / "state.sqlite3")
+            self.store = Store(root / "state.sqlite3", journal=self.journal)
             await self.store.call("open_db")
             self.service = CleanerService(
                 self.settings,
                 self.store,
-                Router(self.context, self.store, pace=lambda: self.settings().pace),
+                Router(self.context, self.store, pace=lambda: self.settings().pace, journal=self.journal),
                 self.journal,
             )
             await self.service.start()
             self.start_error = ""
-            logger.info("QQ 群清理 v0.2.2 已加载；默认只预览，配置中启用后开始检查。")
+            logger.info("QQ 群清理 v0.2.3 已加载；默认只预览，配置中启用后开始检查。")
         except BaseException as exc:
+            if self.journal:
+                self.journal.record("插件初始化失败", exception=exc)
             self.start_error = (
                 str(exc)
                 if isinstance(exc, CleanerError)
                 else "插件初始化失败，请检查数据目录权限和磁盘空间。"
             )
             logger.error("QQ 群清理：%s [%s]", self.start_error, type(exc).__name__)
+            logger.error("QQ 群清理初始化异常详情：%s", exception_detail(exc))
             await self.terminate()
             if not isinstance(exc, Exception):
                 raise
 
     async def terminate(self):
+        try:
+            await self._terminate()
+        except BaseException as exc:
+            logger.error("QQ 群清理关闭异常详情：%s", exception_detail(exc))
+            raise
+
+    async def _terminate(self):
         try:
             if self.service:
                 await self.service.stop()
@@ -107,7 +117,7 @@ class QQGroupCleaner(Star):
         except CleanerError as exc:
             result = str(exc)
         except Exception as exc:
-            service.journal.record("命令异常", type(exc).__name__)
+            service.journal.record("命令异常", exception=exc)
             result = "操作未完成，请查看插件状态和日志。"
         finally:
             service.jobs.discard(task)

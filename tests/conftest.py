@@ -7,6 +7,7 @@ import pytest
 
 from qq_group_cleaner.config import Pace, Policy, Settings
 from qq_group_cleaner.platform import GroupInfo, PlatformError
+from qq_group_cleaner.resources import _LOG_CONTEXT, Journal
 from qq_group_cleaner.rules import DAY, Member
 from qq_group_cleaner.service import CleanerService
 from qq_group_cleaner.store import Store
@@ -119,7 +120,7 @@ class FakeRouter:
         pass
 
 
-class FakeJournal:
+class FakeJournal(Journal):
     def __init__(self):
         self.records = []
         self.failure = None
@@ -131,8 +132,8 @@ class FakeJournal:
     def maintain(self):
         self.check()
 
-    def record(self, *args):
-        self.records.append(args)
+    def record(self, kind, detail="", **fields):
+        self.records.append({**_LOG_CONTEXT.get(), "event": kind, "detail": detail, **fields})
 
 
 @pytest.fixture

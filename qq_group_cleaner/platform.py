@@ -64,7 +64,9 @@ def merge_snapshot_evidence(first: Member, second: Member) -> Member:
 
 
 class Adapter:
-    def __init__(self, platform_id, bot, *, sleep=asyncio.sleep, clock=time.time, store=None, pace=Pace):
+    def __init__(
+        self, platform_id, bot, *, sleep=asyncio.sleep, clock=time.time, store=None, pace=Pace, journal=None
+    ):
         self.platform_id = platform_id
         self.bot = bot
         self.account = ""
@@ -75,6 +77,7 @@ class Adapter:
         self.next_read = 0.0
         self.store = store
         self.pace = pace
+        self.journal = journal
         self._recovery_loaded = False
         self._saved_recovery_until = 0
         self.session = secrets.token_hex(8)
@@ -129,6 +132,19 @@ class Adapter:
         return f"{self.session}:{self.generation}"
 
     async def call(self, action, *, before_send=None, **params):
+        if self.journal is None:
+            return await self._serialized_call(action, before_send=before_send, **params)
+        with self.journal.span(
+            "平台接口",
+            request=secrets.token_hex(6),
+            api=action,
+            platform=self.platform_id,
+            account=self.account,
+            **{key: params[key] for key in ("group_id", "user_id", "no_cache") if key in params},
+        ):
+            return await self._serialized_call(action, before_send=before_send, **params)
+
+    async def _serialized_call(self, action, *, before_send=None, **params):
         async with self.lock:
             if self.store and not self._recovery_loaded:
                 self.recovery_until = max(
@@ -190,9 +206,39 @@ class Adapter:
                 f"{action} 接口未正常完成；已停止本次任务，请检查 NapCat 在线状态和权限。"
             ) from exc
         if isinstance(result, dict) and ("retcode" in result or "status" in result):
+            if self.journal:
+                self.journal.record(
+                    "接口返回状态",
+                    **{
+                        key: result.get(key)
+                        for key in ("retcode", "status", "message", "wording")
+                        if isinstance(result.get(key), (str, int, float, bool, type(None)))
+                    },
+                )
             if result.get("status") != "ok" or result.get("retcode", 0) != 0:
                 raise PlatformError(f"{action} 接口返回失败；请检查 NapCat 状态和权限。")
             result = result.get("data")
+        if self.journal:
+            summary = {"response_type": type(result).__name__}
+            if isinstance(result, list):
+                summary["count"] = len(result)
+            elif isinstance(result, dict):
+                for key in (
+                    "user_id",
+                    "group_id",
+                    "member_count",
+                    "max_member_count",
+                    "online",
+                    "role",
+                    "level",
+                    "qq_level",
+                    "join_time",
+                    "last_sent_time",
+                    "group_all_shut",
+                ):
+                    if key in result and isinstance(result[key], (str, int, float, bool, type(None))):
+                        summary[key] = result[key]
+            self.journal.record("接口数据摘要", response=summary)
         return result
 
     async def identity(self):
@@ -281,12 +327,13 @@ class Adapter:
 
 
 class Router:
-    def __init__(self, context, store=None, *, pace=Pace):
+    def __init__(self, context, store=None, *, pace=Pace, journal=None):
         self.context = context
         self.adapters = {}
         self.lock = asyncio.Lock()
         self.store = store
         self.pace = pace
+        self.journal = journal
 
     async def persist_recovery(self):
         for adapter in self.adapters.values():
@@ -328,7 +375,7 @@ class Router:
                         adapter.begin_recovery()
                         await adapter.persist_recovery()
                     adapter = self.adapters[pid] = Adapter(
-                        pid, platform.bot, store=self.store, pace=self.pace
+                        pid, platform.bot, store=self.store, pace=self.pace, journal=self.journal
                     )
                 try:
                     if (

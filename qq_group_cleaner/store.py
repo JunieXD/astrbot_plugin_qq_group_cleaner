@@ -15,7 +15,7 @@ from .rules import Member
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, journal=None):
         self.path = path
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qq-cleaner-db")
         self.pending = 0
@@ -23,6 +23,7 @@ class Store:
         self.closed = False
         self.closing = False
         self.close_lock = asyncio.Lock()
+        self.journal = journal
 
     async def call(self, method: str, *args):
         if self.closed or ((self.closing or not self.healthy) and method != "close_db"):
@@ -48,6 +49,10 @@ class Store:
             return result
         except (sqlite3.Error, OSError) as exc:
             self.healthy = False
+            if self.journal:
+                self.journal.record(
+                    "数据库操作失败", exception=exc, method=method, pending=self.pending, cancelled=cancelled
+                )
             if cancelled:
                 raise asyncio.CancelledError from exc
             raise CleanerError("审计存储写入失败，已停止清理，请检查磁盘和插件日志。") from exc
@@ -98,10 +103,27 @@ class Store:
             PRAGMA user_version=2;
         """)
         with self.db:
+            interrupted = self.db.execute("SELECT * FROM operations WHERE state='submitted'").fetchall()
+            old_plans = self.db.execute(
+                "SELECT id FROM plans WHERE state IN ('ready','running','pending')"
+            ).fetchall()
             self.db.execute(
                 "UPDATE operations SET state='unknown',reason='插件在操作提交后中断' WHERE state='submitted'"
             )
             self.db.execute("UPDATE plans SET state='cancelled' WHERE state IN ('ready','running','pending')")
+        if self.journal:
+            for op in interrupted:
+                self.journal.record(
+                    "中断操作恢复",
+                    operation=op["id"],
+                    plan=op["plan"],
+                    account=op["account"],
+                    gid=op["gid"],
+                    user=op["uid"],
+                    state="unknown",
+                    reason="插件在提交后中断，需人工核对，不重发",
+                )
+            self.journal.record("启动时作废旧计划", plans=[row["id"] for row in old_plans])
 
     def close_db(self):
         if hasattr(self, "db"):
@@ -217,13 +239,14 @@ class Store:
     def observe(
         self, account, gid, uid, kind, occurred, received, fingerprint, operator="", subtype="", duration=0
     ):
+        confirmed = []
         with self.db:
             if fingerprint:
                 inserted = self.db.execute(
                     "INSERT OR IGNORE INTO events VALUES(?,?)", (fingerprint, received)
                 )
                 if not inserted.rowcount:
-                    return
+                    return "重复事件，已忽略"
             if kind == "group_ban":
                 key = f"ban-notice:{account}:{gid}:{uid}"
                 previous = self.get(key, {})
@@ -231,7 +254,7 @@ class Store:
                     # user_id=0 denotes all-member mute; it lasts until a lift notice.
                     until = occurred + duration if subtype == "ban" else 0
                     self._set(key, {"at": occurred, "until": until, "active": subtype == "ban"})
-                return
+                return "禁言状态已合并，保留较新记录"
             row = self.db.execute(
                 "SELECT * FROM members WHERE account=? AND gid=? AND uid=?", (account, gid, uid)
             ).fetchone()
@@ -263,12 +286,21 @@ class Store:
                 (account, gid, uid, joined, epoch, activity, event_at, present),
             )
             if kind == "group_decrease" and operator == account and subtype == "kick":
+                confirmed = [
+                    dict(op)
+                    for op in self.db.execute(
+                        """SELECT id,plan FROM operations WHERE account=? AND gid=? AND uid=?
+                    AND state IN ('submitted','unknown') AND submitted<=? AND epoch=?""",
+                        (account, gid, uid, occurred + 2, row["epoch"] if row else -1),
+                    ).fetchall()
+                ]
                 self.db.execute(
                     """UPDATE operations SET state='confirmed_removed',reason='收到本账号移出成员通知'
                     WHERE account=? AND gid=? AND uid=? AND state IN ('submitted','unknown')
                     AND submitted<=? AND epoch=?""",
                     (account, gid, uid, occurred + 2, row["epoch"] if row else -1),
                 )
+        return {"reason": "活动或成员状态已合并，保留较新证据", "confirmed_operations": confirmed}
 
     def exclusions(self, account, gid, now):
         rows = self.db.execute(

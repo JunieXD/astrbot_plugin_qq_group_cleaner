@@ -36,6 +36,7 @@ class CleanerService:
         self.store = store
         self.router = router
         self.journal = journal
+        self.store.journal = journal
         self.clock = clock
         self.sleep = sleep
         self.monotonic = monotonic
@@ -80,6 +81,12 @@ class CleanerService:
             now + random.uniform(pace.startup_min_seconds, pace.startup_max_seconds),
         )
         self.task = asyncio.create_task(self.loop(), name="qq-cleaner-scheduler")
+        self.journal.record(
+            "服务启动",
+            revision=self.settings().revision,
+            settings=asdict(self.settings()),
+            failure=self.failure,
+        )
 
     async def stop(self):
         self.stopped = True
@@ -93,6 +100,7 @@ class CleanerService:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.router.persist_recovery()
+        self.journal.record("服务停止", reason="卸载、重载或关闭，已等待活动任务退出")
 
     async def authorize(self, policy, actor, event_platform, event_account):
         revision = self.settings().revision
@@ -132,6 +140,13 @@ class CleanerService:
         return active
 
     async def build_plan(self, policy: Policy, adapter, *, manual=False):
+        plan_id = secrets.token_hex(6)
+        with self.journal.span(
+            "计划检查", plan=plan_id, account=adapter.account, gid=policy.group_id, manual=manual
+        ):
+            return await self._build_plan(policy, adapter, manual=manual, plan_id=plan_id)
+
+    async def _build_plan(self, policy, adapter, *, manual, plan_id):
         self.healthy()
         settings = self.settings()
         gid, account = policy.group_id, adapter.account
@@ -141,6 +156,14 @@ class CleanerService:
             raise PlatformError("QQ 当前离线，暂缓检查。")
         binding = self.router.binding_stamp(adapter)
         info = await adapter.group(gid)
+        self.journal.record(
+            "群资料",
+            count=info.count,
+            capacity=info.capacity,
+            all_muted=info.all_muted,
+            policy=asdict(policy),
+            revision=settings.revision,
+        )
         await self.check_speaking(policy, account, info)
         if policy.trigger > info.capacity:
             raise CleanerError("开始人数超过实际群容量，请调整这个群的配置。")
@@ -153,6 +176,13 @@ class CleanerService:
         )
         triggered = triggered or info.count >= policy.trigger
         if not triggered and not manual:
+            self.journal.record(
+                "本次不生成名单",
+                reason="人数未达到开始线",
+                count=info.count,
+                trigger=policy.trigger,
+                target=policy.target,
+            )
             await self.store.call("set", "check-error:" + gid, "")
             await self.store.call(
                 "set",
@@ -161,6 +191,13 @@ class CleanerService:
             )
             return None
         info, members = await adapter.snapshot(gid)
+        self.journal.record(
+            "一致成员名单已取得",
+            count=info.count,
+            capacity=info.capacity,
+            listed=len(members),
+            all_muted=info.all_muted,
+        )
         await self.check_speaking(policy, account, info)
         # Recompute using the count belonging to the snapshot, not the earlier count.
         triggered = await self.cycle(
@@ -180,17 +217,36 @@ class CleanerService:
         for member in members:
             excluded = member.user_id in protected or (member.user_id, member.epoch) in attempted
             preliminary = evaluate(policy, member, self.clock(), account, excluded, defer_qq=True)
+            if policy.needs_qq_level:
+                self.journal.record(
+                    "成员初筛",
+                    screening=True,
+                    user=member.user_id,
+                    member=asdict(member),
+                    excluded=excluded,
+                    eligible=preliminary.eligible,
+                    reason=preliminary.reason,
+                )
             if preliminary.eligible and policy.needs_qq_level:
                 entry = cache.get(member.user_id, {})
                 if entry.get("epoch") != member.epoch or entry.get("expires", 0) <= self.clock():
                     if looked_up >= 20:
+                        self.journal.record(
+                            "资料补查等待", user=member.user_id, reason="本轮20人补查额度已用完"
+                        )
                         waiting += 1
                         enriched.append(replace(member, qq_level=None))
                         continue
                     looked_up += 1
                     try:
                         detail = await adapter.member(gid, member.user_id)
-                    except PlatformError:
+                    except PlatformError as exc:
+                        self.journal.record(
+                            "成员资料补查失败",
+                            exception=exc,
+                            user=member.user_id,
+                            failure_cache_seconds=6 * 3600,
+                        )
                         # Preserve completed work, and avoid the same bad UID blocking every later scan.
                         cache[member.user_id] = {
                             "epoch": member.epoch,
@@ -208,15 +264,30 @@ class CleanerService:
                     cache[member.user_id] = entry
                     await self.store.call("set", cache_key, cache)
                     member = detail
+                    self.journal.record(
+                        "成员资料补查完成",
+                        user=member.user_id,
+                        qq_level=detail.qq_level,
+                        cache_expires=entry["expires"],
+                    )
+                else:
+                    self.journal.record(
+                        "使用QQ等级缓存",
+                        user=member.user_id,
+                        qq_level=entry["level"],
+                        cache_expires=entry["expires"],
+                    )
                 refreshed_cache[member.user_id] = entry
                 member = replace(member, qq_level=entry["level"])
             enriched.append(member)
         if policy.needs_qq_level:
             await self.store.call("set", cache_key, refreshed_cache)
-        reasons, candidates = Counter(), []
+        reasons, candidates, decisions = Counter(), [], {}
         for member in enriched:
             excluded = member.user_id in protected or (member.user_id, member.epoch) in attempted
-            decision = evaluate(policy, member, self.clock(), account, excluded)
+            evaluated_at = self.clock()
+            decision = evaluate(policy, member, evaluated_at, account, excluded)
+            decisions[member.user_id] = (decision, evaluated_at, excluded)
             if decision.eligible:
                 candidates.append((decision.sort_key, member, decision))
             else:
@@ -224,6 +295,35 @@ class CleanerService:
         candidates.sort(key=lambda row: row[0])
         need = max(0, info.count - policy.target) if triggered else 0
         selected = candidates[: min(need, settings.pace.batch_size)] if not waiting else []
+        ranks = {m.user_id: index for index, (_, m, _) in enumerate(candidates, 1)}
+        selected_ids = {m.user_id for _, m, _ in selected}
+        for member in enriched:
+            decision, evaluated_at, excluded = decisions[member.user_id]
+            if member.user_id in selected_ids:
+                selection_reason = "进入本批名单"
+            elif not decision.eligible:
+                selection_reason = decision.reason
+            elif waiting:
+                selection_reason = "等待QQ等级补查完成，本轮不安排清理"
+            elif not triggered:
+                selection_reason = "人数未触发清理"
+            else:
+                selection_reason = "排序在本批名额之外"
+            self.journal.record(
+                "成员筛选",
+                screening=True,
+                user=member.user_id,
+                member=asdict(member),
+                evaluated_at=evaluated_at,
+                excluded=excluded,
+                eligible=decision.eligible,
+                reason=decision.reason,
+                score=decision.score,
+                sort_key=decision.sort_key,
+                rank=ranks.get(member.user_id),
+                selected=member.user_id in selected_ids,
+                selection_reason=selection_reason,
+            )
         state = "preview"
         if settings.enabled and policy.enabled and selected:
             state = {"仅预览": "preview", "确认后清理": "pending", "自动清理": "ready"}[policy.mode]
@@ -233,7 +333,7 @@ class CleanerService:
         if self.router.binding_stamp(adapter) != binding or self.settings().revision != settings.revision:
             raise CleanerError("检查期间连接或配置改变，请重新预览。")
         payload = {
-            "id": secrets.token_hex(6),
+            "id": plan_id,
             "account": account,
             "platform": adapter.platform_id,
             "binding": binding,
@@ -261,7 +361,17 @@ class CleanerService:
             "status:" + scope(account, gid),
             {"at": now, "count": info.count, "text": "等待资料补全" if waiting else "检查完成"},
         )
-        self.journal.record("计划已生成", payload["id"])
+        self.journal.record(
+            "计划已生成",
+            state=state,
+            count=info.count,
+            eligible=len(candidates),
+            waiting=waiting,
+            reasons=dict(reasons),
+            triggered=triggered,
+            selected=[m.user_id for _, m, _ in selected],
+            expires=payload["expires"],
+        )
         return await self.store.call("plan", payload["id"])
 
     async def check_speaking(self, policy, account, info):
@@ -288,6 +398,9 @@ class CleanerService:
         if policy.mode != "确认后清理" or not plan["members"]:
             raise CleanerError("这个计划不能确认；请使用确认后清理模式并重新预览。")
         await self.store.call("approve", plan_id, actor, self.clock())
+        self.journal.record(
+            "计划已确认", plan=plan_id, actor=actor, account=adapter.account, gid=policy.group_id
+        )
         self.next_check[policy.group_id] = 0
         self.wake.set()
 
@@ -296,6 +409,7 @@ class CleanerService:
         self.memory_pauses.add(key)
         await self.store.call("set", "pause:" + key, "管理员手动暂停")
         await self.store.call("audit", self.clock(), account, gid, "暂停", {"actor": actor})
+        self.journal.record("群清理已暂停", actor=actor, account=account, gid=gid, reason="管理员手动暂停")
 
     async def resume(self, account, gid, actor):
         if await self.store.call("unresolved_account", account):
@@ -335,6 +449,9 @@ class CleanerService:
             await self.store.call("plan_state", latest["id"], "cancelled")
         self.next_check[gid] = 0
         await self.store.call("audit", self.clock(), account, gid, "恢复", {"actor": actor})
+        self.journal.record(
+            "群清理已恢复", actor=actor, account=account, gid=gid, reason="管理员恢复，旧计划作废并保留冷却"
+        )
         self.wake.set()
 
     async def observe(self, raw):
@@ -363,22 +480,43 @@ class CleanerService:
         occurred = number(get("time"))
         if not occurred or occurred > now + 300:
             self.failure = "收到时间异常的群事件，已暂停清理，请检查 NapCat 与系统时间。"
+            self.journal.record(
+                "群事件异常",
+                reason=self.failure,
+                account=account,
+                gid=gid,
+                user=uid,
+                event_type=kind,
+                occurred=occurred,
+                received=now,
+            )
             return
         duration = number(get("duration"), zero=True) if group_ban else 0
         if group_ban and (get("sub_type") not in ("ban", "lift_ban") or duration is None):
             self.failure = "收到无法识别的禁言通知，已暂停清理，请检查 NapCat。"
+            self.journal.record(
+                "群事件异常",
+                reason=self.failure,
+                account=account,
+                gid=gid,
+                user=uid,
+                event_type=kind,
+                subtype=get("sub_type"),
+                duration=duration,
+            )
             return
         key = (account, gid, uid)
         self.event_versions[key] = self.event_versions.get(key, 0) + 1
         if len(self.event_versions) > 100000:
             self.failure = "活动保护记录达到容量上限，请检查群配置后重载。"
+            self.journal.record("群事件异常", reason=self.failure, account=account, gid=gid, user=uid)
             return
         identity = [account, gid, uid, kind, occurred, get("message_id"), get("operator_id"), get("sub_type")]
         if group_ban:
             identity.append(duration)
         fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         try:
-            await self.store.call(
+            outcome = await self.store.call(
                 "observe",
                 account,
                 gid,
@@ -391,10 +529,49 @@ class CleanerService:
                 str(get("sub_type", "")),
                 duration,
             )
+            self.journal.record(
+                "群事件处理",
+                screening=kind == "message",
+                account=account,
+                gid=gid,
+                user=uid,
+                event_type=kind,
+                occurred=occurred,
+                received=now,
+                operator=str(get("operator_id", "")),
+                subtype=str(get("sub_type", "")),
+                duration=duration,
+                fingerprint=fingerprint,
+                result=outcome,
+            )
+            if isinstance(outcome, dict):
+                for op in outcome["confirmed_operations"]:
+                    self.journal.record(
+                        "通知确认移出",
+                        operation=op["id"],
+                        plan=op["plan"],
+                        account=account,
+                        gid=gid,
+                        user=uid,
+                        state="confirmed_removed",
+                        reason="收到匹配本次入群和提交时间的本账号移出通知",
+                    )
         except CleanerError as exc:
             self.failure = str(exc)
+            self.journal.record(
+                "群事件记录失败", exception=exc, account=account, gid=gid, user=uid, event_type=kind
+            )
+        except BaseException as exc:
+            self.journal.record(
+                "群事件处理中断", exception=exc, account=account, gid=gid, user=uid, event_type=kind
+            )
+            raise
 
     async def check_group(self, policy):
+        with self.journal.span("群检查", check=secrets.token_hex(6), gid=policy.group_id):
+            await self._check_group(policy)
+
+    async def _check_group(self, policy):
         from .executor import Executor
 
         gid = policy.group_id
@@ -404,6 +581,7 @@ class CleanerService:
                 # A job may have waited for a concurrent command; use the current policy.
                 policy = self.settings().group(gid)
                 if not self.settings().enabled or not policy.enabled:
+                    self.journal.record("群检查跳过", reason="总开关或群规则已关闭")
                     return
                 adapter = await self.router.resolve(policy)
                 if await self.store.call(
@@ -419,12 +597,13 @@ class CleanerService:
                 if plan and plan["state"] == "ready":
                     await Executor(self).execute(plan, adapter)
                 self.next_check[gid] = self.clock() + random.uniform(1800, 2100)
+                self.journal.record("下次检查已安排", retry_at=self.next_check[gid])
             except Deferred as exc:
                 self.next_check[gid] = max(self.clock() + 15, exc.until)
                 await self.store.call("set", "check-error:" + gid, str(exc))
-                self.journal.record("等待执行", str(exc))
+                self.journal.record("等待执行", str(exc), exception=exc, retry_at=self.next_check[gid])
             except CleanerError as exc:
-                self.journal.record("检查暂缓", str(exc))
+                self.journal.record("检查暂缓", str(exc), exception=exc, retry_at=self.clock() + 3600)
                 await self.store.call("set", "check-error:" + gid, str(exc))
                 self.next_check[gid] = self.clock() + 3600
 
@@ -435,7 +614,7 @@ class CleanerService:
             if task.done():
                 if not task.cancelled() and task.exception():
                     self.failure = "群检查任务异常，已停止清理，请查看日志并重载。"
-                    self.journal.record("任务异常", type(task.exception()).__name__)
+                    self.journal.record("任务异常", exception=task.exception(), gid=gid)
                 del self.workers[gid]
         if self.failure or not self.settings().enabled or self.stopped:
             return
@@ -466,10 +645,10 @@ class CleanerService:
                     maintenance_at = now + 86400
                 self.dispatch()
             except CleanerError as exc:
-                self.journal.record("调度暂停", str(exc))
+                self.journal.record("调度暂停", str(exc), exception=exc)
             except Exception as exc:
                 self.failure = "插件遇到内部异常，已停止清理，请查看日志并重载。"
-                self.journal.record("内部异常", type(exc).__name__)
+                self.journal.record("内部异常", exception=exc)
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=15)
             except asyncio.TimeoutError:

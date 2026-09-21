@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime
 
 from .config import identifier, integer
@@ -26,6 +27,20 @@ STATES = {
     "confirmed_removed": "已证实由本账号移出",
     "observed_absent": "已确认不在群（无法归因）",
     "reviewed_retained": "人工保留，不再重复提交",
+}
+
+COMMAND_SHAPES = {
+    "状态": (2, 2),
+    "预览": (2, 2),
+    "确认": (3, 3),
+    "暂停": (2, 2),
+    "恢复": (2, 2),
+    "解释": (3, 3),
+    "保护": (3, 4),
+    "取消保护": (3, 3),
+    "历史": (2, 2),
+    "核对": (2, 2),
+    "保留": (3, 3),
 }
 
 
@@ -72,6 +87,32 @@ class Commands:
         self.s = service
 
     async def run(self, text, actor, platform_id, self_id):
+        parts = text.strip().lstrip("/").split()
+        if parts and parts[0] in ("群清理", "qgclean"):
+            parts.pop(0)
+        action = parts[0] if parts else "帮助"
+        with self.s.journal.span(
+            "管理员命令",
+            command=secrets.token_hex(6),
+            actor=actor,
+            platform=platform_id,
+            account=self_id,
+            action=action if action in COMMAND_SHAPES or action == "帮助" else "无效命令",
+            gid=parts[1]
+            if len(parts) > 1 and len(parts[1]) <= 20 and parts[1].isascii() and parts[1].isdigit()
+            else None,
+            arguments=[
+                arg if arg.isascii() and arg.isalnum() and len(arg) <= 20 else "无效参数"
+                for arg in parts[2:4]
+            ]
+            if len(text) <= 512
+            else [],
+        ):
+            result = await self._run(text, actor, platform_id, self_id)
+            self.s.journal.record("命令处理结果", result=result)
+            return result
+
+    async def _run(self, text, actor, platform_id, self_id):
         s = self.s
         parts = text.strip().lstrip("/").split()
         if parts and parts[0] in ("群清理", "qgclean"):
@@ -79,23 +120,10 @@ class Commands:
         if not parts or parts == ["帮助"]:
             return HELP
         action = parts[0]
-        shapes = {
-            "状态": (2, 2),
-            "预览": (2, 2),
-            "确认": (3, 3),
-            "暂停": (2, 2),
-            "恢复": (2, 2),
-            "解释": (3, 3),
-            "保护": (3, 4),
-            "取消保护": (3, 3),
-            "历史": (2, 2),
-            "核对": (2, 2),
-            "保留": (3, 3),
-        }
         if (
             len(text) > 512
-            or action not in shapes
-            or not shapes[action][0] <= len(parts) <= shapes[action][1]
+            or action not in COMMAND_SHAPES
+            or not COMMAND_SHAPES[action][0] <= len(parts) <= COMMAND_SHAPES[action][1]
         ):
             return HELP
         gid = identifier(parts[1], "群号")

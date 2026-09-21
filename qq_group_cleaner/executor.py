@@ -69,11 +69,22 @@ class Executor:
         if not in_window(now, settings.pace):
             raise Deferred("当前不在执行时段内。", now + 300)
         used_account, used_group = await self.store.call("quota", plan["account"], plan["gid"], now)
+        s.journal.record(
+            "执行额度核验",
+            used_account=used_account,
+            used_group=used_group,
+            account_limit=settings.pace.account_daily_limit,
+            group_limit=settings.pace.group_daily_limit,
+        )
         if used_group >= settings.pace.group_daily_limit or used_account >= settings.pace.account_daily_limit:
             raise Deferred("最近 24 小时额度已用完，稍后检查。", now + 3600)
         return policy, settings
 
     async def execute(self, plan, adapter):
+        with self.s.journal.span("批次执行", plan=plan["id"], account=plan["account"], gid=plan["gid"]):
+            await self._execute_with_recovery(plan, adapter)
+
+    async def _execute_with_recovery(self, plan, adapter):
         try:
             await self._execute(plan, adapter)
         finally:
@@ -98,6 +109,7 @@ class Executor:
                 "batch:" + scope(adapter.account, policy.group_id),
                 s.clock() + settings.pace.batch_minutes * 60,
             )
+            completed = set()
             try:
                 for item in plan["members"]:
                     ready_at = max(
@@ -105,12 +117,20 @@ class Executor:
                         s.clock() + random.uniform(settings.pace.min_delay, settings.pace.max_delay),
                     )
                     await self.store.call("set", "write-at:" + adapter.account, ready_at)
+                    s.journal.record(
+                        "成员操作等待",
+                        user=item["member"]["user_id"],
+                        reason="随机操作间隔及已有预约",
+                        ready_at=ready_at,
+                        reason_selected=item["reason"],
+                        score=item.get("score"),
+                    )
                     await s.sleep(max(0, ready_at - s.clock()))
                     await self.gate(plan)
                     guard = s.router.shared_guard()
 
                     async def action():
-                        with read_priority(1):
+                        with read_priority(1), s.journal.span("成员处理", user=item["member"]["user_id"]):
                             return await self.one(plan, adapter, Member(**item["member"]))
 
                     async def online():
@@ -138,7 +158,29 @@ class Executor:
                         except guard.deferred_error as exc:
                             raise Deferred("共享操作队列正在冷却，稍后重新检查。", s.clock() + 3600) from exc
                     if result == "stop":
+                        s.journal.record(
+                            "批次提前结束",
+                            reason="群人数已达到目标",
+                            remaining=[
+                                row["member"]["user_id"]
+                                for row in plan["members"]
+                                if row["member"]["user_id"] not in completed
+                            ],
+                        )
                         break
+                    completed.add(item["member"]["user_id"])
+            except BaseException as exc:
+                s.journal.record(
+                    "批次中断",
+                    exception=exc,
+                    remaining=[
+                        item["member"]["user_id"]
+                        for item in plan["members"]
+                        if item["member"]["user_id"] not in completed
+                    ],
+                    reason="停止后续处理，当前成员是否已提交以操作记录为准",
+                )
+                raise
             finally:
                 # Cancellation still completes the DB write via Store.call's shield.
                 await self.store.call("plan_state", plan["id"], "finished")
@@ -200,6 +242,14 @@ class Executor:
             account,
             fresh.user_id in protected or (fresh.user_id, fresh.epoch) in attempted,
         )
+        s.journal.record(
+            "执行前复核",
+            original=original.__dict__,
+            current=fresh.__dict__,
+            eligible=decision.eligible,
+            reason=decision.reason,
+            score=decision.score,
+        )
         if fresh.epoch != original.epoch or fresh.joined != original.joined or not decision.eligible:
             await self.store.call(
                 "audit",
@@ -213,6 +263,9 @@ class Executor:
                     "reason": decision.reason if not decision.eligible else "入群身份已变化",
                 },
             )
+            s.journal.record(
+                "成员跳过", reason=decision.reason if not decision.eligible else "入群身份已变化"
+            )
             return "skip"
         info = await adapter.group(gid)
         await s.check_speaking(policy, account, info)
@@ -220,15 +273,25 @@ class Executor:
             raise CleanerError("群容量发生变化，请调整人数配置。")
         if info.count <= policy.target:
             await self.store.call("set", "cycle:" + scope(account, gid), {})
+            s.journal.record("成员未处理", reason="群人数已达到目标", count=info.count, target=policy.target)
             return "stop"
         if not await s.cycle(policy, account, info.count, plan["revision"], activate=False):
             raise CleanerError("清理周期已失效，请重新预览。")
         await self.gate(plan)
         try:
             self.volatile_check(plan, adapter, fresh.user_id, versions, verified_at)
-        except CleanerError:
+        except CleanerError as exc:
+            s.journal.record("成员跳过", exception=exc, reason=str(exc))
             return "skip"
-        s.journal.record("准备提交", plan["id"])
+        s.journal.record(
+            "准备提交",
+            user=fresh.user_id,
+            reason=decision.reason,
+            count=info.count,
+            target=policy.target,
+            score=decision.score,
+            reject_add_request=False,
+        )
         s.healthy()
         operation_id = await self.store.call(
             "reserve",
@@ -239,6 +302,7 @@ class Executor:
             settings.pace.account_daily_limit,
         )
         sent = False
+        s.journal.record("写前意图已保存", operation=operation_id, user=fresh.user_id)
 
         def before_send():
             nonlocal sent
@@ -247,9 +311,17 @@ class Executor:
 
         try:
             await adapter.kick(gid, fresh.user_id, before_send=before_send)
-        except BaseException:
+        except BaseException as exc:
+            s.journal.record(
+                "移出请求中断",
+                exception=exc,
+                operation=operation_id,
+                transport_entered=sent,
+                reason="不重复提交" if sent else "尚未发送，取消写前意图",
+            )
             if not sent:
                 await self.store.call("cancel_intent", operation_id, s.clock())
+                s.journal.record("写前意图已取消", operation=operation_id, reason="尚未发送，已释放本次额度")
             else:
                 await self.store.call(
                     "result", operation_id, "unknown", "请求中断或返回异常，不重复提交", s.clock()
@@ -259,34 +331,78 @@ class Executor:
                     "account-pause:" + account,
                     {"gid": gid, "reason": "管理请求中断或返回异常，需人工核对"},
                 )
+                s.journal.record(
+                    "账号已暂停",
+                    operation=operation_id,
+                    state="unknown",
+                    reason="请求进入传输后异常，结果未知，保留额度并等待人工核对",
+                )
             raise
+        s.journal.record(
+            "移出接口已返回", operation=operation_id, reason="接口成功返回，仍需核验实际离群结果"
+        )
         state = await self.verify(adapter, operation_id)
         if state == "unknown":
             await self.store.call(
                 "set", "account-pause:" + account, {"gid": gid, "reason": "移出结果不明，需核对或保留"}
             )
+            s.journal.record(
+                "账号已暂停",
+                operation=operation_id,
+                state=state,
+                reason="不能证实离群，等待核对或保留，不重发",
+            )
             raise CleanerError("移出结果不明，已暂停账号；请查看历史，核对后再恢复。")
-        s.journal.record("操作核验完成", f"{plan['id']} {state}")
         return state
 
     async def verify(self, adapter, operation_id):
+        with self.s.journal.span("操作核验", operation=operation_id, account=adapter.account):
+            return await self._verify(adapter, operation_id)
+
+    async def _verify(self, adapter, operation_id):
         s = self.s
         await s.sleep(10)
         op = await self.store.call("operation", operation_id)
         if op["state"] == "confirmed_removed":
+            s.journal.record(
+                "操作核验结果",
+                state=op["state"],
+                reason="已收到匹配的本账号移出通知",
+                user=op["uid"],
+                gid=op["gid"],
+                plan=op["plan"],
+            )
             return op["state"]
         try:
             _, members = await adapter.snapshot(op["gid"])
             if op["uid"] not in {m.user_id for m in members}:
-                return await self.store.call(
+                state = await self.store.call(
                     "result",
                     operation_id,
                     "observed_absent",
                     "两次一致名单与群人数证实已不在群，无法归因于本插件",
                     s.clock(),
                 )
-        except CleanerError:
-            pass
-        return await self.store.call(
+                s.journal.record(
+                    "操作核验结果",
+                    state=state,
+                    user=op["uid"],
+                    gid=op["gid"],
+                    plan=op["plan"],
+                    reason="两次一致名单证实不在群，无法归因于本插件",
+                )
+                return state
+        except CleanerError as exc:
+            s.journal.record("离群核验查询失败", exception=exc, user=op["uid"], gid=op["gid"])
+        state = await self.store.call(
             "result", operation_id, "unknown", "尚不能证实成员已离群，不重复提交", s.clock()
         )
+        s.journal.record(
+            "操作核验结果",
+            state=state,
+            user=op["uid"],
+            gid=op["gid"],
+            plan=op["plan"],
+            reason="尚不能证实成员已离群，不重复提交",
+        )
+        return state
