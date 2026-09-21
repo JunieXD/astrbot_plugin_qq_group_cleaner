@@ -213,7 +213,7 @@ class CleanerService:
             excluded = member.user_id in protected or (member.user_id, member.epoch) in attempted
             decision = evaluate(policy, member, self.clock(), account, excluded)
             if decision.eligible:
-                candidates.append((decision.sort_key, member, decision.reason))
+                candidates.append((decision.sort_key, member, decision))
             else:
                 reasons[decision.reason] += 1
         candidates.sort(key=lambda row: row[0])
@@ -244,7 +244,10 @@ class CleanerService:
             "waiting": waiting,
             "reasons": dict(reasons),
             "policy": asdict(policy),
-            "members": [{"member": asdict(m), "reason": reason} for _, m, reason in selected],
+            "members": [
+                {"member": asdict(m), "reason": decision.reason, "score": decision.score}
+                for _, m, decision in selected
+            ],
         }
         await self.store.call("save_plan", payload, state)
         await self.store.call("set", "check-error:" + gid, "")

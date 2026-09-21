@@ -9,7 +9,12 @@
       "target": 470,
       "inactive_days": 90,
       "newcomer_days": 30,
-      "order": "最久未发言优先"
+      "order": "综合排序",
+      "score_weights": {
+        "inactive": 70,
+        "group_level": 30,
+        "qq_level": 0
+      }
     },
     {
       "__template_key": "group",

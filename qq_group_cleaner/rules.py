@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import Policy
+from .config import CleanerError, Policy
 
 DAY = 86400
 
@@ -57,6 +57,25 @@ class Decision:
     eligible: bool
     reason: str
     sort_key: tuple = ()
+    score: float | None = None
+
+
+def weighted_score(policy: Policy, member: Member, inactive_days: int) -> float:
+    """Fixed scales keep scores comparable without extra requests or cohort-dependent ranks."""
+    weights = policy.score_weights
+    if weights.total <= 0:
+        raise CleanerError("综合排序至少有一项权重大于0。")
+    # Eligibility is checked separately. Only time beyond that minimum contributes.
+    inactivity = min(max(inactive_days - policy.inactive_days, 0) / 180, 1) * 100
+    total = weights.inactive * inactivity
+    for name in ("group_level", "qq_level"):
+        weight = getattr(weights, name)
+        if weight:
+            level = getattr(member, name)
+            if level is None:
+                raise CleanerError("评分所需的等级资料缺失，不能计算得分。")
+            total += weight * max(0, 100 - level)
+    return round(total / weights.total, 6)
 
 
 def evaluate(
@@ -110,20 +129,27 @@ def evaluate(
             return keep("QQ 等级未知，需候选资料核验")
         if policy.max_qq_level and member.qq_level > policy.max_qq_level:
             return keep("QQ 等级高于候选上限")
-    values = {
-        "inactive": last_active,
-        "inactive_bucket": sum(days >= b for b in (90, 180, 365)),
-        "group_level": member.group_level,
-        "qq_level": member.qq_level,
-        "joined": member.joined,
-    }
-    # Ascending tuple: old last-active first, large inactivity bucket first, low levels first.
-    values["inactive_bucket"] = -values["inactive_bucket"]
-    fields = [f for f in policy.sort_fields if not (defer_qq and f == "qq_level")]
-    key = tuple(values[f] for f in fields) + (int(member.user_id),)
+    score = None
+    if policy.order == "综合排序":
+        # Preliminary filtering must not invent a score before QQ enrichment is complete.
+        if not defer_qq:
+            score = weighted_score(policy, member, days)
+        key = (-(score or 0), last_active, int(member.user_id))
+    else:
+        values = {
+            "inactive": last_active,
+            "inactive_bucket": -sum(days >= b for b in (90, 180, 365)),
+            "group_level": member.group_level,
+            "qq_level": member.qq_level,
+            "joined": member.joined,
+        }
+        fields = [f for f in policy.sort_fields if not (defer_qq and f == "qq_level")]
+        key = tuple(values[f] for f in fields) + (int(member.user_id),)
     details = [f"{days} 天未发言"]
+    if score is not None:
+        details.insert(0, f"综合得分 {score:.1f}/100")
     if policy.needs_group_level:
         details.append(f"群等级 {member.group_level}")
     if policy.needs_qq_level and not defer_qq:
         details.append(f"QQ 等级 {member.qq_level}")
-    return Decision(True, "，".join(details), key)
+    return Decision(True, "，".join(details), key, score)

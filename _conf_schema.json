@@ -32,7 +32,19 @@
             "hint": "至少7天。在群时间不足的成员受到保护，即使平台发言时间很早。"},
           "order": {"description": "先清理谁", "type": "string", "default": "最久未发言优先",
             "options": ["最久未发言优先", "群等级低优先", "QQ等级低优先", "综合排序", "自定义"],
-            "hint": "只对已符合条件的人排序。综合排序：未发言时长档位→群等级低→QQ等级低→最久未发言。依赖的等级未知时保留，可能导致候选减少。"},
+            "hint": "只对已符合条件的人排序。综合排序按加权得分由高到低：越久未发言、等级越低，越优先。默认不使用QQ等级，减少资料补查。"},
+          "score_weights": {
+            "description": "综合排序权重", "type": "object",
+            "hint": "只在选择综合排序时生效。数值越大越看重该项，0表示不参与；无需凑满100，至少一项大于0。保护条件始终优先于得分。",
+            "items": {
+              "inactive": {"description": "未发言时长", "type": "int", "default": 70,
+                "hint": "0～100。越久未发言，得分越高；默认70。"},
+              "group_level": {"description": "群等级", "type": "int", "default": 30,
+                "hint": "0～100。群等级越低，得分越高；默认30。启用后等级未知的人保留。"},
+              "qq_level": {"description": "QQ等级", "type": "int", "default": 0,
+                "hint": "0～100。QQ等级越低，得分越高。默认0，不为排名补查候选QQ等级；设为正数会增加查询和等待。QQ等级上限条件仍独立生效。"}
+            }
+          },
           "protect_level": {"description": "群等级达到多少就保护", "type": "int", "default": 0,
             "hint": "0表示不使用等级保护。设为10则群等级≥10的人受保护。开启后，等级读取不到的人也会保留。"},
           "protected_users": {"description": "始终保留的QQ号", "type": "list", "default": [],

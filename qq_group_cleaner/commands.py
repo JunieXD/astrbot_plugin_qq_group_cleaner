@@ -40,8 +40,14 @@ def render_plan(plan):
     if not plan["triggered"]:
         lines.append("尚未达到开始线，本次不安排清理。")
     if plan["waiting"]:
-        lines.append(f"还有 {plan['waiting']} 人的 QQ 等级待补查。本轮不安排清理，后续检查会继续补全。")
-    lines.append(f"符合条件 {plan['eligible']} 人，本批名单 {len(plan['members'])} 人：")
+        lines.append(f"还有 {plan['waiting']} 人的 QQ 等级待补查，不计入下方已核验人数。本轮不安排清理。")
+    weights = plan.get("policy", {}).get("score_weights")
+    if plan.get("policy", {}).get("order") == "综合排序" and weights:
+        lines.append(
+            f"按综合得分由高到低排序；权重：未发言 {weights['inactive']} / 群等级 {weights['group_level']} / QQ等级 {weights['qq_level']}。"
+        )
+    label = "资料已齐且符合条件" if plan["waiting"] else "符合条件"
+    lines.append(f"{label} {plan['eligible']} 人，本批名单 {len(plan['members'])} 人：")
     for item in plan["members"]:
         lines.append(f"• {item['member']['user_id']}：{item['reason']}")
     if plan["reasons"]:

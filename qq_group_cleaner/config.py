@@ -23,7 +23,7 @@ ORDERS = {
     "最久未发言优先": ("inactive",),
     "群等级低优先": ("group_level", "inactive"),
     "QQ等级低优先": ("qq_level", "inactive"),
-    "综合排序": ("inactive_bucket", "group_level", "qq_level", "inactive"),
+    "综合排序": (),  # Its dependencies come from the enabled score weights.
 }
 SORT_FIELDS = {
     "未发言天数": "inactive",
@@ -32,6 +32,17 @@ SORT_FIELDS = {
     "QQ等级": "qq_level",
     "入群时间": "joined",
 }
+
+
+@dataclass(frozen=True)
+class ScoreWeights:
+    inactive: int = 70
+    group_level: int = 30
+    qq_level: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.inactive + self.group_level + self.qq_level
 
 
 @dataclass(frozen=True)
@@ -52,9 +63,16 @@ class Policy:
     protect_title: bool = True
     protect_muted: bool = True
     bot_qq: str = ""
+    score_weights: ScoreWeights = field(default_factory=ScoreWeights)
 
     @property
     def sort_fields(self) -> tuple[str, ...]:
+        if self.order == "综合排序":
+            return tuple(
+                name
+                for name in ("inactive", "group_level", "qq_level")
+                if getattr(self.score_weights, name) > 0
+            )
         return self.custom_order if self.order == "自定义" else ORDERS[self.order]
 
     @property
@@ -136,6 +154,21 @@ def parse_settings(raw: dict) -> Settings:
             order = row.get("order", "最久未发言优先")
             if mode not in MODES or order not in (*ORDERS, "自定义"):
                 raise CleanerError("请选择有效的运行方式和清理顺序。")
+            weights_raw = row.get("score_weights", {})
+            if not isinstance(weights_raw, dict):
+                raise CleanerError("综合排序权重格式不正确。")
+            weights = ScoreWeights(
+                **{
+                    name: integer(weights_raw.get(name, getattr(ScoreWeights(), name)), label, 0, 100)
+                    for name, label in (
+                        ("inactive", "未发言时长权重"),
+                        ("group_level", "群等级权重"),
+                        ("qq_level", "QQ等级权重"),
+                    )
+                }
+            )
+            if order == "综合排序" and weights.total == 0:
+                raise CleanerError("综合排序至少有一项权重大于0。")
             custom = advanced.get("custom_order", [])
             if not isinstance(custom, list) or any(k not in SORT_FIELDS for k in custom):
                 raise CleanerError("自定义顺序可填：" + "、".join(SORT_FIELDS))
@@ -161,6 +194,7 @@ def parse_settings(raw: dict) -> Settings:
                 protect_title=boolean(advanced, "protect_title", True),
                 protect_muted=boolean(advanced, "protect_muted", True),
                 bot_qq=identifier(advanced.get("bot_qq", ""), "机器人 QQ", optional=True),
+                score_weights=weights,
             )
             if policy.target >= policy.trigger:
                 raise CleanerError("停止人数必须小于开始人数。")
