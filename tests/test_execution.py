@@ -7,6 +7,7 @@ from conftest import ACCOUNT, ADMIN, GROUP
 from qq_group_cleaner.config import CleanerError, Deferred
 from qq_group_cleaner.executor import Executor
 from qq_group_cleaner.platform import PlatformError
+from qq_group_cleaner.rules import DAY, Member
 
 
 async def plan_for(env):
@@ -26,6 +27,39 @@ async def test_success_stops_at_target_and_never_rejects_rejoin(env):
     assert all(r["state"] == "observed_absent" for r in rows)
     assert await env.store.call("quota", ACCOUNT, GROUP, env.clock()) == (3, 3)
     assert sum(t >= 30 for t in env.clock.waits) == 3
+
+
+@pytest.mark.parametrize("detail_level,removed", [(0, True), ("0", True), (None, False), (70, False)])
+async def test_zero_group_level_survives_planning_and_is_revalidated_before_removal(
+    env, detail_level, removed
+):
+    policy = replace(env.policy, order="综合排序", inactive_days=30, protect_level=70)
+    env.box.settings = replace(env.box.settings, groups=(policy,))
+    joined = int(env.clock() - 59 * DAY)
+    raw = {
+        "user_id": "200001",
+        "role": "member",
+        "level": "0",
+        "join_time": joined,
+        "last_sent_time": joined,
+        "title": "",
+        "shut_up_timestamp": 0,
+    }
+    env.adapter.people["200001"] = Member.from_api(raw)
+    for uid in ("200002", "200003"):
+        env.adapter.people[uid] = replace(env.adapter.people[uid], last_sent=int(env.clock()))
+    plan = await plan_for(env)
+    assert plan["eligible"] == 1
+    assert plan["members"][0]["score"] == pytest.approx(41.277778)
+    assert not env.adapter.details  # Accepting group level 0 adds no enrichment calls.
+
+    async def update_detail(uid):
+        if uid == "200001":
+            env.adapter.people[uid] = Member.from_api({**raw, "level": detail_level})
+
+    env.adapter.detail_hook = update_detail
+    await Executor(env.service).execute(plan, env.adapter)
+    assert env.adapter.kicks == (["200001"] if removed else [])
 
 
 async def test_zero_write_in_preview_or_disabled_mode(env):

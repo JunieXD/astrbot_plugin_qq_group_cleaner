@@ -44,7 +44,7 @@ class Member:
             role=str(raw.get("role", "")),
             joined=number(raw.get("join_time")),
             last_sent=number(raw.get("last_sent_time")),
-            group_level=number(raw.get("level")),
+            group_level=number(raw.get("level"), zero=True),
             qq_level=number(raw.get("qq_level")),
             title=raw.get("title") if isinstance(raw.get("title"), str) else None,
             muted_until=number(raw.get("shut_up_timestamp"), zero=True),
@@ -119,7 +119,7 @@ def evaluate(
     if policy.protect_muted and member.muted_until > now:
         return keep("正在被禁言")
     if policy.needs_group_level and member.group_level is None:
-        return keep("群等级未知（接口的 0 不作为低等级）")
+        return keep("群等级资料缺失或无效")
     if policy.protect_level and member.group_level >= policy.protect_level:
         return keep("达到群等级保护线")
     if policy.max_group_level and member.group_level > policy.max_group_level:

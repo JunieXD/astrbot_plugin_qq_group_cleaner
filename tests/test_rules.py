@@ -54,10 +54,44 @@ def test_boundaries_and_group_level_protection():
     assert not evaluate(policy, replace(candidate, group_level=None), now, ACCOUNT).eligible
 
 
-@pytest.mark.parametrize("value", [0, "0", None, "", -1, "NaN", True, 1.5])
+@pytest.mark.parametrize("value", [None, "", -1, "NaN", True, False, 1.5])
 def test_invalid_levels_are_unknown(value):
     m = Member.from_api({"user_id": "200001", "level": value, "qq_level": value})
     assert m.group_level is None and m.qq_level is None
+
+
+@pytest.mark.parametrize("value", [0, "0"])
+def test_explicit_zero_group_level_is_valid_but_zero_qq_level_still_needs_enrichment(value):
+    m = Member.from_api({"user_id": "200001", "level": value, "qq_level": value})
+    assert m.group_level == 0 and m.qq_level is None
+    missing = Member.from_api({"user_id": "200001"})
+    assert missing.group_level is None and missing.qq_level is None
+
+
+@pytest.mark.parametrize("order", ["综合排序", "群等级低优先"])
+def test_zero_level_from_api_participates_in_ranking_and_still_requires_inactivity(order):
+    now = Clock()()
+    joined = int(now - 59 * DAY)
+    candidate = Member.from_api(
+        {
+            "user_id": "200001",
+            "role": "member",
+            "level": "0",
+            "join_time": joined,
+            "last_sent_time": joined,
+            "title": "",
+            "shut_up_timestamp": 0,
+        }
+    )
+    policy = Policy(GROUP, order=order, inactive_days=30, protect_level=70, max_group_level=3)
+    decision = evaluate(policy, candidate, now, ACCOUNT)
+    assert decision.eligible and "群等级 0" in decision.reason
+    higher = evaluate(policy, replace(candidate, group_level=1), now, ACCOUNT)
+    assert decision.sort_key < higher.sort_key
+    if order == "综合排序":
+        assert decision.score == pytest.approx(41.277778)
+    for changes in ({"last_sent": int(now)}, {"activity": now}, {"role": "admin"}):
+        assert not evaluate(policy, replace(candidate, **changes), now, ACCOUNT).eligible
 
 
 def test_unknown_unneeded_levels_do_not_prevent_inactivity_only_rules():
