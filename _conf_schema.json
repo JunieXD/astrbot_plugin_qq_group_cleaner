@@ -1,0 +1,74 @@
+{
+  "enabled": {
+    "description": "启用定时检查",
+    "type": "bool",
+    "default": false,
+    "hint": "第一次使用先添加群并私聊机器人预览。开启后，按每个群选择的运行方式检查。关闭可停止所有尚未提交的清理。"
+  },
+  "groups": {
+    "description": "要管理的群",
+    "type": "template_list",
+    "default": [],
+    "hint": "一个群添加一条。群主、管理员、机器人自身始终受到保护。群设置互相独立。",
+    "templates": {
+      "group": {
+        "name": "添加一个群",
+        "display_item": "group_id",
+        "items": {
+          "group_id": {"description": "QQ群号", "type": "string", "default": ""},
+          "enabled": {"description": "检查这个群", "type": "bool", "default": true},
+          "mode": {
+            "description": "运行方式", "type": "string", "default": "仅预览",
+            "options": ["仅预览", "确认后清理", "自动清理"],
+            "hint": "仅预览不会移出任何人。确认后清理需要私聊 /群清理 预览 群号，再确认本批名单。自动清理按规则自行处理。"
+          },
+          "trigger": {"description": "人数达到多少时开始", "type": "int", "default": 490,
+            "hint": "填写人数，例如500人群填写490。未达到时不清理。"},
+          "target": {"description": "人数降到多少时停止", "type": "int", "default": 470,
+            "hint": "必须小于开始人数。分批腾出空间；符合条件的人不足时不会放宽规则。"},
+          "inactive_days": {"description": "至少多少天未发言才可清理", "type": "int", "default": 90,
+            "hint": "至少7天。使用QQ群提供的最后发言时间，并以插件观察到的近期活动补充保护。读取、潜水不能识别。"},
+          "newcomer_days": {"description": "新成员保护多少天", "type": "int", "default": 30,
+            "hint": "至少7天。在群时间不足的成员受到保护，即使平台发言时间很早。"},
+          "order": {"description": "先清理谁", "type": "string", "default": "最久未发言优先",
+            "options": ["最久未发言优先", "群等级低优先", "QQ等级低优先", "综合排序", "自定义"],
+            "hint": "只对已符合条件的人排序。综合排序：未发言时长档位→群等级低→QQ等级低→最久未发言。依赖的等级未知时保留，可能导致候选减少。"},
+          "protect_level": {"description": "群等级达到多少就保护", "type": "int", "default": 0,
+            "hint": "0表示不使用等级保护。设为10则群等级≥10的人受保护。开启后，等级读取不到的人也会保留。"},
+          "protected_users": {"description": "始终保留的QQ号", "type": "list", "default": [],
+            "hint": "每项填写一个QQ号，不需要添加群主和管理员。也可以私聊使用保护命令。"},
+          "advanced": {
+            "description": "更多条件（可不填）", "type": "object",
+            "hint": "下列条件与未发言天数同时满足才可清理。平时保留默认值即可。",
+            "items": {
+              "max_group_level": {"description": "只考虑群等级不高于多少的人", "type": "int", "default": 0,
+                "hint": "0表示不限制；正数包含边界，例如3表示≤3。"},
+              "max_qq_level": {"description": "只考虑QQ等级不高于多少的人", "type": "int", "default": 0,
+                "hint": "0表示不限制。QQ等级会分轮补查，资料不足时不执行。"},
+              "protect_title": {"description": "保留有群专属头衔的人", "type": "bool", "default": true},
+              "protect_muted": {"description": "保留正在被禁言的人", "type": "bool", "default": true},
+              "custom_order": {"description": "自定义清理顺序", "type": "list", "default": [],
+                "hint": "仅在先清理谁选择自定义时生效。按优先级逐项填写：群等级、未发言天数、QQ等级、未发言时长档位、入群时间。等级由低到高；未发言由久到近；入群由早到晚。可选一项或多项，不重复。"},
+              "bot_qq": {"description": "负责这个群的机器人QQ（通常留空）", "type": "string", "default": "",
+                "hint": "AstrBot只接入一个QQ时自动识别；接入多个QQ时才需要填写。"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "pace": {
+    "description": "执行节奏（默认即可）", "type": "object",
+    "hint": "所有群共用。按最近24小时计数，失败或结果不明的已提交请求也计入上限。随机等待不能保证避免QQ风控。",
+    "items": {
+      "batch_size": {"description": "每批最多清理几人", "type": "int", "default": 5, "hint": "1～10人；确认仅授权这一批名单。"},
+      "group_daily_limit": {"description": "每个群24小时最多几人", "type": "int", "default": 20, "hint": "1～100人。"},
+      "account_daily_limit": {"description": "每个机器人24小时总共最多几人", "type": "int", "default": 30, "hint": "本插件各群合计，1～100人。"},
+      "batch_minutes": {"description": "两批至少间隔几分钟", "type": "int", "default": 60, "hint": "30～1440分钟，每群分别计算。"},
+      "min_delay": {"description": "每人操作前最短等待秒数", "type": "int", "default": 30, "hint": "10～600秒，每次随机抽取。"},
+      "max_delay": {"description": "每人操作前最长等待秒数", "type": "int", "default": 90, "hint": "不能小于最短等待，最多600秒。"},
+      "start_hour": {"description": "每天几点开始允许清理", "type": "int", "default": 9, "hint": "北京时间0～23点；默认09:00开始。"},
+      "end_hour": {"description": "每天几点停止清理", "type": "int", "default": 22, "hint": "北京时间0～24点；默认22:00停止。全天填0～24，跨午夜可填22～6。"}
+    }
+  }
+}

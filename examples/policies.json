@@ -1,322 +1,35 @@
 {
-  "schema_version": 1,
   "enabled": false,
-  "operator_qq_ids": [],
-  "defaults": {
-    "trigger": {
-      "kind": "absolute",
-      "trigger_count": 490,
-      "target_count": 470,
-      "trigger_percent": 98,
-      "target_percent": 94,
-      "check_interval_seconds": 1800,
-      "check_jitter_seconds": 300,
-      "on_membership_change": true,
-      "event_debounce_seconds": 300,
-      "cycle_max_days": 7
-    },
-    "protection": {
-      "whitelist": [],
-      "temporary_whitelist": [],
-      "new_member_days": 30,
-      "recent_activity_days": 30,
-      "group_level_enabled": false,
-      "group_level_min": 10,
-      "qq_level_enabled": false,
-      "qq_level_min": 64,
-      "title_mode": "off",
-      "title_allowlist": [],
-      "protect_marked_bots": true,
-      "protect_muted": true,
-      "pause_when_all_muted": true,
-      "after_all_mute_grace_days": 7,
-      "custom_rules_enabled": false
-    },
-    "eligibility": {
-      "mode": "simple",
-      "minimum_join_days": 30,
-      "minimum_inactive_days": 90,
-      "group_level_enabled": false,
-      "group_level_max": 3,
-      "qq_level_enabled": false,
-      "qq_level_max": 32,
-      "unknown_policy": "skip_member"
-    },
-    "activity": {
-      "source": "platform_speech",
-      "count_poke": false,
-      "count_reaction": false,
-      "unknown_last_speech": "protect",
-      "count_window_days": 30
-    },
-    "data": {
-      "member_cache_seconds": 1800,
-      "plan_snapshot_max_age_seconds": 1800,
-      "qq_level_lookup": "off",
-      "qq_level_cache_hours": 24,
-      "qq_level_batch_limit": 10,
-      "group_level_certified": false,
-      "invalid_field_ratio_stop": 0.5
-    },
-    "ranking": {
-      "preset": "conservative",
-      "inactive_buckets_days": [
-        90,
-        180,
-        365
-      ],
-      "unknown_sort_value": "defer"
-    },
-    "execution": {
-      "timezone": "Asia/Shanghai",
-      "allowed_weekdays": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7
-      ],
-      "windows": [
-        {
-          "start": "09:00",
-          "end": "21:00"
-        }
-      ],
-      "batch_size": 5,
-      "max_kicks_rolling_24h": 20,
-      "batch_gap_seconds": 3600,
-      "candidate_delay_min_seconds": 30,
-      "candidate_delay_max_seconds": 90,
-      "plan_ttl_seconds": 1800,
-      "verify_wait_seconds": 10,
-      "verify_attempts": 2
-    },
-    "notifications": {
-      "enabled": true,
-      "recipient_qq_ids": [],
-      "on_plan": true,
-      "on_batch": true,
-      "on_pause": true,
-      "dedup_seconds": 3600,
-      "max_messages_rolling_24h": 10,
-      "mask_member_ids": true
-    }
-  },
   "groups": [
     {
-      "policy_id": "study_group",
-      "name": "学习群示例",
-      "enabled": false,
-      "platform_id": "example-aiocqhttp",
-      "self_id": "300000001",
-      "group_id": "200000001",
-      "run_mode": "observe",
-      "admin_qq_ids": [],
-      "overrides": {
-        "protection": {
-          "mode": "custom",
-          "value": {
-            "whitelist": [],
-            "temporary_whitelist": [],
-            "new_member_days": 60,
-            "recent_activity_days": 30,
-            "group_level_enabled": true,
-            "group_level_min": 10,
-            "qq_level_enabled": false,
-            "qq_level_min": 64,
-            "title_mode": "off",
-            "title_allowlist": [],
-            "protect_marked_bots": true,
-            "protect_muted": true,
-            "pause_when_all_muted": true,
-            "after_all_mute_grace_days": 7,
-            "custom_rules_enabled": false
-          }
-        },
-        "eligibility": {
-          "mode": "custom",
-          "value": {
-            "mode": "simple",
-            "minimum_join_days": 60,
-            "minimum_inactive_days": 180,
-            "group_level_enabled": false,
-            "group_level_max": 3,
-            "qq_level_enabled": false,
-            "qq_level_max": 32,
-            "unknown_policy": "skip_member"
-          }
-        }
-      }
+      "__template_key": "group",
+      "group_id": "100001",
+      "mode": "确认后清理",
+      "trigger": 490,
+      "target": 470,
+      "inactive_days": 90,
+      "newcomer_days": 30,
+      "order": "最久未发言优先"
     },
     {
-      "policy_id": "public_group",
-      "name": "公开交流群示例",
-      "enabled": false,
-      "platform_id": "example-aiocqhttp",
-      "self_id": "300000001",
-      "group_id": "200000002",
-      "run_mode": "observe",
-      "admin_qq_ids": [],
-      "overrides": {
-        "trigger": {
-          "mode": "custom",
-          "value": {
-            "kind": "percent",
-            "trigger_count": 490,
-            "target_count": 470,
-            "trigger_percent": 98,
-            "target_percent": 94,
-            "check_interval_seconds": 1800,
-            "check_jitter_seconds": 300,
-            "on_membership_change": true,
-            "event_debounce_seconds": 300,
-            "cycle_max_days": 7
-          }
-        },
-        "eligibility": {
-          "mode": "custom",
-          "value": {
-            "mode": "rules",
-            "minimum_join_days": 30,
-            "minimum_inactive_days": 90,
-            "group_level_enabled": false,
-            "group_level_max": 3,
-            "qq_level_enabled": false,
-            "qq_level_max": 32,
-            "unknown_policy": "skip_member"
-          }
-        },
-        "data": {
-          "mode": "custom",
-          "value": {
-            "member_cache_seconds": 1800,
-            "plan_snapshot_max_age_seconds": 1800,
-            "qq_level_lookup": "on_demand",
-            "qq_level_cache_hours": 24,
-            "qq_level_batch_limit": 10,
-            "group_level_certified": false,
-            "invalid_field_ratio_stop": 0.5
-          }
-        },
-        "ranking": {
-          "mode": "custom",
-          "value": {
-            "preset": "custom",
-            "inactive_buckets_days": [
-              90,
-              180,
-              365
-            ],
-            "unknown_sort_value": "defer"
-          }
-        }
+      "__template_key": "group",
+      "group_id": "100002",
+      "mode": "仅预览",
+      "trigger": 980,
+      "target": 950,
+      "inactive_days": 180,
+      "newcomer_days": 60,
+      "order": "自定义",
+      "protect_level": 10,
+      "advanced": {
+        "max_group_level": 3,
+        "max_qq_level": 20,
+        "custom_order": [
+          "群等级",
+          "未发言天数",
+          "QQ等级"
+        ]
       }
     }
-  ],
-  "rule_clauses": [
-    {
-      "policy_id": "public_group",
-      "phase": "candidate",
-      "rule_id": "A",
-      "field": "inactive_days",
-      "op": ">=",
-      "value": 180,
-      "enabled": true
-    },
-    {
-      "policy_id": "public_group",
-      "phase": "candidate",
-      "rule_id": "A",
-      "field": "group_level",
-      "op": "<",
-      "value": 8,
-      "enabled": true
-    },
-    {
-      "policy_id": "public_group",
-      "phase": "candidate",
-      "rule_id": "B",
-      "field": "inactive_days",
-      "op": ">=",
-      "value": 90,
-      "enabled": true
-    },
-    {
-      "policy_id": "public_group",
-      "phase": "candidate",
-      "rule_id": "B",
-      "field": "group_level",
-      "op": "<",
-      "value": 3,
-      "enabled": true
-    },
-    {
-      "policy_id": "public_group",
-      "phase": "candidate",
-      "rule_id": "B",
-      "field": "qq_level",
-      "op": "<",
-      "value": 32,
-      "enabled": true
-    }
-  ],
-  "sort_rules": [
-    {
-      "policy_id": "public_group",
-      "priority": 1,
-      "field": "group_level",
-      "direction": "asc",
-      "enabled": true
-    },
-    {
-      "policy_id": "public_group",
-      "priority": 2,
-      "field": "inactive_days",
-      "direction": "desc",
-      "enabled": true
-    },
-    {
-      "policy_id": "public_group",
-      "priority": 3,
-      "field": "qq_level",
-      "direction": "asc",
-      "enabled": true
-    }
-  ],
-  "account_safety": {
-    "shared_guard": "auto",
-    "write_gap_min_seconds": 30,
-    "write_gap_max_seconds": 90,
-    "read_gap_min_seconds": 2,
-    "read_gap_max_seconds": 5,
-    "max_kicks_rolling_24h": 30,
-    "max_reads_hour": 120,
-    "max_reads_rolling_24h": 600,
-    "max_detail_reads_rolling_24h": 80,
-    "max_qq_enrich_rolling_24h": 20,
-    "max_notifications_rolling_24h": 30,
-    "recovery_min_seconds": 300,
-    "recovery_max_seconds": 900,
-    "failure_threshold": 3,
-    "failure_cooldown_seconds": 3600,
-    "read_retry_limit": 2
-  },
-  "logging": {
-    "level": "INFO",
-    "max_file_mb": 10,
-    "backup_count": 7,
-    "retention_days": 14,
-    "error_dedup_seconds": 300,
-    "debug_retention_days": 3
-  },
-  "storage": {
-    "audit_retention_days": 180,
-    "member_snapshot_retention_days": 30,
-    "activity_retention_days": 400,
-    "export_retention_hours": 24,
-    "max_database_mb": 512,
-    "minimum_free_mb": 256
-  }
+  ]
 }

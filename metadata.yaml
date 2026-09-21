@@ -1,10 +1,11 @@
 name: astrbot_plugin_qq_group_cleaner
-desc: 设计阶段：按群人数与可配置的不活跃规则规划成员清理，尚未实现运行功能。
-help: 当前为方案仓库，请阅读 README.md 和 docs/，暂不可安装运行。
-version: v0.0.0
+desc: 群人数达到设定值时，按未发言时间和等级规则分批清理，支持预览、确认和自动模式。
+help: 先在配置中添加群，然后私聊机器人发送 /群清理 预览 群号。发送 /群清理 查看帮助。
+version: v0.1.0
 author: JunieXD
 repo: https://github.com/JunieXD/astrbot_plugin_qq_group_cleaner
-display_name: QQ 群成员清理（设计阶段）
+display_name: QQ 群成员清理
 short_desc: 分群设置人数阈值、保护条件、候选规则与排序策略。
 support_platforms:
   - aiocqhttp
+astrbot_version: ">=4.26.2,<5"

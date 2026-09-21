@@ -1,0 +1,361 @@
+"""Planning and lifecycle. Every destructive action goes through Executor."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import random
+import secrets
+import time
+from collections import Counter
+from dataclasses import asdict, replace
+
+from .config import CleanerError, Deferred, Policy
+from .rules import evaluate, number
+
+
+def scope(account, gid):
+    return f"{account}:{gid}"
+
+
+class CleanerService:
+    def __init__(
+        self,
+        settings,
+        store,
+        router,
+        journal,
+        *,
+        clock=time.time,
+        sleep=asyncio.sleep,
+        monotonic=time.monotonic,
+    ):
+        self.settings = settings
+        self.store = store
+        self.router = router
+        self.journal = journal
+        self.clock = clock
+        self.sleep = sleep
+        self.monotonic = monotonic
+        self.stopped = False
+        self.failure = ""
+        self.group_locks = {}
+        self.account_locks = {}
+        self.event_versions = {}
+        self.memory_pauses = set()
+        self.task = None
+        self.jobs = set()
+        self.wake = asyncio.Event()
+        self.next_check = {}
+        self.command_next = {}
+        self.last_clock = (self.clock(), self.monotonic())
+
+    def group_lock(self, gid):
+        return self.group_locks.setdefault(gid, asyncio.Lock())
+
+    def healthy(self):
+        if self.stopped or self.failure or not self.store.healthy:
+            raise CleanerError(self.failure or "插件已停止或存储异常，请检查日志后重载。")
+        wall, monotonic = self.last_clock
+        current, current_mono = self.clock(), self.monotonic()
+        if abs((current - wall) - (current_mono - monotonic)) > 120:
+            self.failure = "系统时间发生跳变，已停止清理，请校准时间后重载插件。"
+            raise CleanerError(self.failure)
+        self.last_clock = (current, current_mono)
+        self.journal.check()
+
+    async def start(self):
+        now = self.clock()
+        previous = await self.store.call("get", "last_wall", now)
+        if now < previous - 120:
+            self.failure = "系统时间早于上次运行，请校准时间后重载插件。"
+        # Restart cannot shorten a previously reserved delay.
+        until = max(await self.store.call("get", "startup_until", 0), now + random.uniform(300, 900))
+        await self.store.call("set", "startup_until", until)
+        self.task = asyncio.create_task(self.loop(), name="qq-cleaner-scheduler")
+
+    async def stop(self):
+        self.stopped = True
+        self.wake.set()
+        tasks = set(self.jobs)
+        if self.task:
+            tasks.add(self.task)
+        for task in tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def authorize(self, policy, actor, event_platform, event_account):
+        adapter = await self.router.resolve(policy)
+        if adapter.platform_id != event_platform or adapter.account != event_account:
+            raise CleanerError("请私聊负责这个群的机器人账号。")
+        member = await adapter.member(policy.group_id, actor)
+        if member.role not in ("owner", "admin"):
+            raise CleanerError("只有这个群当前的群主或管理员可以操作和查看名单。")
+        return adapter
+
+    async def cycle(self, policy, account, count, revision, activate=True):
+        key = "cycle:" + scope(account, policy.group_id)
+        state = await self.store.call("get", key, {})
+        active = state.get("revision") == revision and state.get("expires", 0) > self.clock()
+        if count <= policy.target:
+            await self.store.call("set", key, {})
+            return False
+        if count >= policy.trigger and activate:
+            if not active:
+                await self.store.call("set", key, {"revision": revision, "expires": self.clock() + 7 * 86400})
+            return True
+        return active
+
+    async def build_plan(self, policy: Policy, adapter, *, manual=False):
+        self.healthy()
+        settings = self.settings()
+        gid, account = policy.group_id, adapter.account
+        info = await adapter.group(gid)
+        if policy.trigger > info.capacity:
+            raise CleanerError("开始人数超过实际群容量，请调整这个群的配置。")
+        triggered = await self.cycle(
+            policy,
+            account,
+            info.count,
+            settings.revision,
+            settings.enabled and policy.enabled and policy.mode != "仅预览",
+        )
+        triggered = triggered or info.count >= policy.trigger
+        if not triggered and not manual:
+            await self.store.call("set", "check-error:" + gid, "")
+            await self.store.call(
+                "set",
+                "status:" + scope(account, gid),
+                {"at": self.clock(), "count": info.count, "text": "人数未达到开始线"},
+            )
+            return None
+        info, members = await adapter.snapshot(gid)
+        # Recompute using the count belonging to the snapshot, not the earlier count.
+        triggered = await self.cycle(
+            policy,
+            account,
+            info.count,
+            settings.revision,
+            settings.enabled and policy.enabled and policy.mode != "仅预览",
+        )
+        triggered = triggered or info.count >= policy.trigger
+        members = await self.store.call("merge", account, gid, members)
+        protected, attempted = await self.store.call("exclusions", account, gid, self.clock())
+        cache_key = "qq-cache:" + scope(account, gid)
+        cache = await self.store.call("get", cache_key, {}) if policy.needs_qq_level else {}
+        refreshed_cache, enriched = {}, []
+        looked_up = waiting = 0
+        for member in members:
+            excluded = member.user_id in protected or (member.user_id, member.epoch) in attempted
+            preliminary = evaluate(policy, member, self.clock(), account, excluded, defer_qq=True)
+            if preliminary.eligible and policy.needs_qq_level:
+                entry = cache.get(member.user_id, {})
+                if entry.get("epoch") != member.epoch or entry.get("expires", 0) <= self.clock():
+                    if looked_up >= 20:
+                        waiting += 1
+                        enriched.append(replace(member, qq_level=None))
+                        continue
+                    looked_up += 1
+                    detail = await adapter.member(gid, member.user_id)
+                    detail = (await self.store.call("merge", account, gid, [detail]))[0]
+                    entry = {"epoch": detail.epoch, "expires": self.clock() + 86400, "level": detail.qq_level}
+                    member = detail
+                refreshed_cache[member.user_id] = entry
+                member = replace(member, qq_level=entry["level"])
+            enriched.append(member)
+        if policy.needs_qq_level:
+            await self.store.call("set", cache_key, refreshed_cache)
+        reasons, candidates = Counter(), []
+        for member in enriched:
+            excluded = member.user_id in protected or (member.user_id, member.epoch) in attempted
+            decision = evaluate(policy, member, self.clock(), account, excluded)
+            if decision.eligible:
+                candidates.append((decision.sort_key, member, decision.reason))
+            else:
+                reasons[decision.reason] += 1
+        candidates.sort(key=lambda row: row[0])
+        need = max(0, info.count - policy.target) if triggered else 0
+        selected = candidates[: min(need, settings.pace.batch_size)] if not waiting else []
+        state = "preview"
+        if settings.enabled and policy.enabled and selected:
+            state = {"仅预览": "preview", "确认后清理": "pending", "自动清理": "ready"}[policy.mode]
+            if manual and policy.mode == "自动清理":
+                state = "preview"
+        now = self.clock()
+        payload = {
+            "id": secrets.token_hex(6),
+            "account": account,
+            "platform": adapter.platform_id,
+            "gid": gid,
+            "revision": settings.revision,
+            "created": now,
+            "expires": now + 1800,
+            "count": info.count,
+            "capacity": info.capacity,
+            "target": policy.target,
+            "triggered": triggered,
+            "eligible": len(candidates),
+            "waiting": waiting,
+            "reasons": dict(reasons),
+            "policy": asdict(policy),
+            "members": [{"member": asdict(m), "reason": reason} for _, m, reason in selected],
+        }
+        await self.store.call("save_plan", payload, state)
+        await self.store.call("set", "check-error:" + gid, "")
+        await self.store.call(
+            "set",
+            "status:" + scope(account, gid),
+            {"at": now, "count": info.count, "text": "等待资料补全" if waiting else "检查完成"},
+        )
+        self.journal.record("计划已生成", payload["id"])
+        return await self.store.call("plan", payload["id"])
+
+    async def confirm(self, plan_id, policy, adapter, actor):
+        self.healthy()
+        settings = self.settings()
+        plan = await self.store.call("plan", plan_id)
+        if (
+            plan["gid"] != policy.group_id
+            or plan["account"] != adapter.account
+            or plan["platform"] != adapter.platform_id
+        ):
+            raise CleanerError("确认码不属于这个群或机器人。")
+        if plan["revision"] != settings.revision or not settings.enabled or not policy.enabled:
+            raise CleanerError("配置已改变或未启用，请重新预览。")
+        if policy.mode != "确认后清理" or not plan["members"]:
+            raise CleanerError("这个计划不能确认；请使用确认后清理模式并重新预览。")
+        await self.store.call("approve", plan_id, actor, self.clock())
+        self.next_check[policy.group_id] = 0
+        self.wake.set()
+
+    async def pause(self, account, gid, actor):
+        key = scope(account, gid)
+        self.memory_pauses.add(key)
+        await self.store.call("set", "pause:" + key, "管理员手动暂停")
+        await self.store.call("audit", self.clock(), account, gid, "暂停", {"actor": actor})
+
+    async def resume(self, account, gid, actor):
+        if await self.store.call("unresolved_account", account):
+            raise CleanerError("此账号还有结果不明的操作，请先使用“核对”或“保留”。")
+        await self.store.call("set", "pause:" + scope(account, gid), "")
+        await self.store.call("set", "account-pause:" + account, "")
+        await self.store.call("set", "cooldown:" + account, self.clock() + random.uniform(300, 900))
+        self.memory_pauses.discard(scope(account, gid))
+        latest = await self.store.call("latest", account, gid)
+        if latest:
+            await self.store.call("plan_state", latest["id"], "cancelled")
+        self.next_check[gid] = 0
+        await self.store.call("audit", self.clock(), account, gid, "恢复", {"actor": actor})
+        self.wake.set()
+
+    async def observe(self, raw):
+        """Only positive activity evidence; never infer silence from missing local messages."""
+        if self.stopped or self.failure:
+            return
+        get = raw.get if isinstance(raw, dict) else lambda k, d=None: getattr(raw, k, d)
+        account, gid, uid = (str(get(k, "")) for k in ("self_id", "group_id", "user_id"))
+        if not all(number(v) for v in (account, gid, uid)):
+            return
+        try:
+            policy = self.settings().group(gid)
+        except CleanerError:
+            return
+        if policy.bot_qq and policy.bot_qq != account:
+            return
+        kind = (
+            "message"
+            if get("post_type") == "message" and get("message_type") == "group"
+            else get("notice_type")
+        )
+        if kind not in ("message", "group_increase", "group_decrease", "group_admin"):
+            return
+        now = self.clock()
+        occurred = number(get("time"))
+        if not occurred or occurred > now + 300:
+            self.failure = "收到时间异常的群事件，已暂停清理，请检查 NapCat 与系统时间。"
+            return
+        key = (account, gid, uid)
+        self.event_versions[key] = self.event_versions.get(key, 0) + 1
+        if len(self.event_versions) > 100000:
+            self.failure = "活动保护记录达到容量上限，请检查群配置后重载。"
+            return
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [account, gid, uid, kind, occurred, get("message_id"), get("operator_id"), get("sub_type")]
+            ).encode()
+        ).hexdigest()
+        try:
+            await self.store.call(
+                "observe",
+                account,
+                gid,
+                uid,
+                kind,
+                occurred,
+                now,
+                fingerprint,
+                str(get("operator_id", "")),
+                str(get("sub_type", "")),
+            )
+        except CleanerError as exc:
+            self.failure = str(exc)
+
+    async def loop(self):
+        from .executor import Executor
+
+        executor = Executor(self)
+        maintenance_at = 0
+        while not self.stopped:
+            try:
+                self.healthy()
+                settings = self.settings()
+                now = self.clock()
+                await self.store.call("set", "last_wall", now)
+                if now >= maintenance_at:
+                    await self.store.call("maintain", now)
+                    self.journal.maintain()
+                    maintenance_at = now + 86400
+                if settings.enabled:
+                    for policy in settings.groups:
+                        if not policy.enabled or self.group_lock(policy.group_id).locked():
+                            continue
+                        async with self.group_lock(policy.group_id):
+                            try:
+                                # Only poll bindings when this group has due work.
+                                if self.next_check.get(policy.group_id, 0) > self.clock():
+                                    continue
+                                adapter = await self.router.resolve(policy)
+                                if await self.store.call(
+                                    "get", "account-pause:" + adapter.account, ""
+                                ) or await self.store.call("unresolved_account", adapter.account):
+                                    raise CleanerError("此账号存在暂停或待核对操作，请核对后恢复。")
+                                if await self.store.call(
+                                    "get", "pause:" + scope(adapter.account, policy.group_id), ""
+                                ):
+                                    raise CleanerError("本群已由管理员暂停。")
+                                plan = await self.store.call("latest", adapter.account, policy.group_id)
+                                ready = plan and plan["state"] == "ready" and plan["expires"] > self.clock()
+                                if not ready:
+                                    plan = await self.build_plan(policy, adapter)
+                                if plan and plan["state"] == "ready":
+                                    await executor.execute(plan, adapter)
+                                self.next_check[policy.group_id] = self.clock() + random.uniform(1800, 2100)
+                            except Deferred as exc:
+                                self.next_check[policy.group_id] = max(self.clock() + 15, exc.until)
+                                self.journal.record("等待执行", str(exc))
+                            except CleanerError as exc:
+                                self.journal.record("检查暂缓", str(exc))
+                                await self.store.call("set", "check-error:" + policy.group_id, str(exc))
+                                self.next_check[policy.group_id] = self.clock() + 3600
+            except CleanerError as exc:
+                self.journal.record("调度暂停", str(exc))
+            except Exception as exc:
+                self.failure = "插件遇到内部异常，已停止清理，请查看日志并重载。"
+                self.journal.record("内部异常", type(exc).__name__)
+            self.wake.clear()
+            try:
+                await asyncio.wait_for(self.wake.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
