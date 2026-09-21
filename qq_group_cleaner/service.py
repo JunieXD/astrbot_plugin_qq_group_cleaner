@@ -73,8 +73,12 @@ class CleanerService:
         if now < previous - 120:
             self.failure = "系统时间早于上次运行，请校准时间后重载插件。"
         # Restart cannot shorten a previously reserved delay.
-        until = max(await self.store.call("get", "startup_until", 0), now + random.uniform(300, 900))
-        await self.store.call("set", "startup_until", until)
+        pace = self.settings().pace
+        await self.store.call(
+            "extend_deadline",
+            "startup_until",
+            now + random.uniform(pace.startup_min_seconds, pace.startup_max_seconds),
+        )
         self.task = asyncio.create_task(self.loop(), name="qq-cleaner-scheduler")
 
     async def stop(self):
@@ -88,6 +92,7 @@ class CleanerService:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.router.persist_recovery()
 
     async def authorize(self, policy, actor, event_platform, event_account):
         revision = self.settings().revision
@@ -318,7 +323,12 @@ class CleanerService:
             await self.store.call("clear_group_ban", account, gid, ban, actor, self.clock())
         await self.store.call("set", "pause:" + scope(account, gid), "")
         await self.store.call("set", "account-pause:" + account, "")
-        await self.store.call("set", "cooldown:" + account, self.clock() + random.uniform(300, 900))
+        pace = self.settings().pace
+        await self.store.call(
+            "extend_deadline",
+            "cooldown:" + account,
+            self.clock() + random.uniform(pace.recovery_min_seconds, pace.recovery_max_seconds),
+        )
         self.memory_pauses.discard(scope(account, gid))
         latest = await self.store.call("latest", account, gid)
         if latest:

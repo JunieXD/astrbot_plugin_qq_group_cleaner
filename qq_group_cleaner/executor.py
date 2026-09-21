@@ -14,6 +14,21 @@ from .service import scope
 CHINA = timezone(timedelta(hours=8))
 
 
+def wait_message(reason, until):
+    end = datetime.fromtimestamp(until, CHINA).strftime("%m-%d %H:%M:%S")
+    return f"正在等待{reason}，最早可于 {end} 继续（北京时间）。"
+
+
+async def scheduled_wait(store, account, gid, *, first=True, connection_until=0):
+    waits = [
+        (await store.call("get", "startup_until", 0), "普通启动/重载缓冲"),
+        (max(await store.call("get", "cooldown:" + account, 0), connection_until), "连接或异常恢复冷却"),
+    ]
+    if first:
+        waits.append((await store.call("get", "batch:" + scope(account, gid), 0), "批次间隔"))
+    return max(waits)
+
+
 def in_window(now, pace):
     hour = datetime.fromtimestamp(now, CHINA).hour
     if pace.start_hour < pace.end_hour:
@@ -48,14 +63,9 @@ class Executor:
             raise CleanerError("此账号已暂停；请核对历史中的异常记录，再使用恢复命令。")
         if await self.store.call("unresolved_account", plan["account"]):
             raise CleanerError("存在结果不明的操作，需先核对或保留成员。")
-        until = max(
-            await self.store.call("get", "startup_until", 0),
-            await self.store.call("get", "cooldown:" + plan["account"], 0),
-        )
-        if first:
-            until = max(until, await self.store.call("get", "batch:" + key, 0))
+        until, reason = await scheduled_wait(self.store, plan["account"], plan["gid"], first=first)
         if now < until:
-            raise Deferred("正在等待启动冷却或下一批间隔。", until)
+            raise Deferred(wait_message(reason, until), until)
         if not in_window(now, settings.pace):
             raise Deferred("当前不在执行时段内。", now + 300)
         used_account, used_group = await self.store.call("quota", plan["account"], plan["gid"], now)
@@ -68,9 +78,8 @@ class Executor:
             await self._execute(plan, adapter)
         finally:
             if adapter.recovery_until:
-                prior = await self.store.call("get", "cooldown:" + adapter.account, 0)
                 await self.store.call(
-                    "set", "cooldown:" + adapter.account, max(prior, adapter.recovery_until)
+                    "extend_deadline", "cooldown:" + adapter.account, adapter.recovery_until
                 )
 
     async def _execute(self, plan, adapter):
@@ -81,7 +90,7 @@ class Executor:
         async with lock:
             self.check_binding(plan, adapter)
             if adapter.recovery_until > s.clock():
-                raise Deferred("连接刚恢复，等待冷却后重新检查。", adapter.recovery_until)
+                raise Deferred(wait_message("连接恢复冷却", adapter.recovery_until), adapter.recovery_until)
             policy, settings = await self.gate(plan, first=True)
             await self.store.call("plan_state", plan["id"], "running")
             await self.store.call(
@@ -117,8 +126,8 @@ class Executor:
                                 online=online,
                                 action=action,
                                 config={
-                                    "recovery_min_seconds": 300,
-                                    "recovery_max_seconds": 900,
+                                    "recovery_min_seconds": settings.pace.recovery_min_seconds,
+                                    "recovery_max_seconds": settings.pace.recovery_max_seconds,
                                     "failure_threshold": 1,
                                     "failure_cooldown_seconds": 3600,
                                 },
@@ -166,7 +175,12 @@ class Executor:
             actors.add(current_plan["approver"])
         versions = {uid: s.event_versions.get((account, gid, uid), 0) for uid in actors}
         if not await adapter.online():
-            await self.store.call("set", "cooldown:" + account, s.clock() + random.uniform(300, 900))
+            await self.store.call(
+                "extend_deadline",
+                "cooldown:" + account,
+                s.clock()
+                + random.uniform(settings.pace.recovery_min_seconds, settings.pace.recovery_max_seconds),
+            )
             raise CleanerError("QQ 当前离线，已停止执行并进入恢复冷却。")
         await adapter.identity()
         self.check_binding(plan, adapter)

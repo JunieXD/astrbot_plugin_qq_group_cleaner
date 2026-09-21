@@ -115,6 +115,9 @@ class FakeRouter:
     def binding_stamp(self, adapter):
         return self.binding
 
+    async def persist_recovery(self):
+        pass
+
 
 class FakeJournal:
     def __init__(self):

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
-from .config import CleanerError, Deferred, Policy
+from .config import CleanerError, Deferred, Pace, Policy
 from .rules import Member, number
 
 
@@ -64,7 +64,7 @@ def merge_snapshot_evidence(first: Member, second: Member) -> Member:
 
 
 class Adapter:
-    def __init__(self, platform_id, bot, *, sleep=asyncio.sleep, clock=time.time, store=None):
+    def __init__(self, platform_id, bot, *, sleep=asyncio.sleep, clock=time.time, store=None, pace=Pace):
         self.platform_id = platform_id
         self.bot = bot
         self.account = ""
@@ -74,6 +74,9 @@ class Adapter:
         self.reads = deque()
         self.next_read = 0.0
         self.store = store
+        self.pace = pace
+        self._recovery_loaded = False
+        self._saved_recovery_until = 0
         self.session = secrets.token_hex(8)
         self.generation = 0
         self.recovery_until = 0
@@ -81,6 +84,20 @@ class Adapter:
         self.invalid_identity = False
         self._connection = self._connection_token()
         self._connection_objects = self._client_objects()
+
+    def begin_recovery(self):
+        pace = self.pace()
+        self.recovery_until = max(
+            self.recovery_until,
+            self.clock() + random.uniform(pace.recovery_min_seconds, pace.recovery_max_seconds),
+        )
+
+    async def persist_recovery(self):
+        if self.store and self.recovery_until > self._saved_recovery_until:
+            self.recovery_until = await self.store.call(
+                "extend_deadline", "connection-cooldown:" + self.platform_id, self.recovery_until
+            )
+            self._saved_recovery_until = self.recovery_until
 
     def _client_objects(self):
         clients = getattr(self.bot, "_wsr_api_clients", None)
@@ -100,7 +117,7 @@ class Adapter:
             # during a disconnect/reconnect that occurs entirely between two inspections.
             self._connection_objects = self._client_objects()
             self.generation += 1
-            self.recovery_until = max(self.recovery_until, self.clock() + random.uniform(300, 900))
+            self.begin_recovery()
         if current is not None and len(current) > 1:
             self.invalid_identity = True
             raise PlatformError("同一接入连接了多个 QQ，请为每个 QQ 使用独立接入。")
@@ -113,56 +130,70 @@ class Adapter:
 
     async def call(self, action, *, before_send=None, **params):
         async with self.lock:
-            self.connection_stamp()
-            if action != "set_group_kick":
-                now = self.clock()
-                while self.reads and self.reads[0] <= now - 3600:
-                    self.reads.popleft()
-                limit = (120, 150, 180)[_READ_PRIORITY.get()]
-                if self.store:
-                    await self.store.call("reserve_read", self.platform_id, now, limit)
-                elif len(self.reads) >= limit:
-                    raise Deferred("本小时资料读取已达上限，稍后再检查。", self.reads[0] + 3601)
-                await self.sleep(max(0, self.next_read - now))
-                self.reads.append(self.clock())
-                self.next_read = self.clock() + random.uniform(1.5, 3.0)
-
-            async def invoke():
-                self.connection_stamp()
-                clients = self._connection_token()
-                if clients:
-                    params["self_id"] = clients[0][0]  # Explicit aiocqhttp routing, also for commands.
-                # Recheck inside the transport task so notices already queued on the
-                # event loop can invalidate the write before transport actually starts.
-                if before_send is not None:
-                    before_send()
-                return await self.bot.call_action(action=action, **params)
-
+            if self.store and not self._recovery_loaded:
+                self.recovery_until = max(
+                    self.recovery_until,
+                    await self.store.call("get", "connection-cooldown:" + self.platform_id, 0),
+                )
+                self._online = await self.store.call("get", "connection-online:" + self.platform_id)
+                self._recovery_loaded = True
             try:
-                # Explicit scheduling keeps this boundary identical on Python 3.10+;
-                # wait_for(coroutine) itself schedules differently across Python versions.
-                result = await asyncio.wait_for(asyncio.create_task(invoke()), timeout=25)
-            except CleanerError:
-                raise
-            except Exception as exc:
-                if type(exc).__name__ in {
-                    "NetworkError",
-                    "ApiNotAvailable",
-                    "TimeoutError",
-                    "ConnectionError",
-                    "ConnectionResetError",
-                }:
-                    self.generation += 1
-                    self.recovery_until = max(self.recovery_until, self.clock() + random.uniform(300, 900))
-                # Do not expose exception text: transport errors can contain authentication URLs.
-                raise PlatformError(
-                    f"{action} 接口未正常完成；已停止本次任务，请检查 NapCat 在线状态和权限。"
-                ) from exc
-            if isinstance(result, dict) and ("retcode" in result or "status" in result):
-                if result.get("status") != "ok" or result.get("retcode", 0) != 0:
-                    raise PlatformError(f"{action} 接口返回失败；请检查 NapCat 状态和权限。")
-                result = result.get("data")
-            return result
+                return await self._call(action, before_send=before_send, **params)
+            finally:
+                # Read failures and reconnects must survive an ordinary short reload too.
+                await self.persist_recovery()
+
+    async def _call(self, action, *, before_send=None, **params):
+        self.connection_stamp()
+        if action != "set_group_kick":
+            now = self.clock()
+            while self.reads and self.reads[0] <= now - 3600:
+                self.reads.popleft()
+            limit = (120, 150, 180)[_READ_PRIORITY.get()]
+            if self.store:
+                await self.store.call("reserve_read", self.platform_id, now, limit)
+            elif len(self.reads) >= limit:
+                raise Deferred("本小时资料读取已达上限，稍后再检查。", self.reads[0] + 3601)
+            await self.sleep(max(0, self.next_read - now))
+            self.reads.append(self.clock())
+            self.next_read = self.clock() + random.uniform(1.5, 3.0)
+
+        async def invoke():
+            self.connection_stamp()
+            clients = self._connection_token()
+            if clients:
+                params["self_id"] = clients[0][0]  # Explicit aiocqhttp routing, also for commands.
+            # Recheck inside the transport task so notices already queued on the
+            # event loop can invalidate the write before transport actually starts.
+            if before_send is not None:
+                before_send()
+            return await self.bot.call_action(action=action, **params)
+
+        try:
+            # Explicit scheduling keeps this boundary identical on Python 3.10+;
+            # wait_for(coroutine) itself schedules differently across Python versions.
+            result = await asyncio.wait_for(asyncio.create_task(invoke()), timeout=25)
+        except CleanerError:
+            raise
+        except Exception as exc:
+            if type(exc).__name__ in {
+                "NetworkError",
+                "ApiNotAvailable",
+                "TimeoutError",
+                "ConnectionError",
+                "ConnectionResetError",
+            }:
+                self.generation += 1
+                self.begin_recovery()
+            # Do not expose exception text: transport errors can contain authentication URLs.
+            raise PlatformError(
+                f"{action} 接口未正常完成；已停止本次任务，请检查 NapCat 在线状态和权限。"
+            ) from exc
+        if isinstance(result, dict) and ("retcode" in result or "status" in result):
+            if result.get("status") != "ok" or result.get("retcode", 0) != 0:
+                raise PlatformError(f"{action} 接口返回失败；请检查 NapCat 状态和权限。")
+            result = result.get("data")
+        return result
 
     async def identity(self):
         data = await self.call("get_login_info")
@@ -180,10 +211,14 @@ class Adapter:
         online = isinstance(data, dict) and data.get("online") is True and data.get("good", True) is True
         if not online and self._online is not False:
             self.generation += 1
+            self.begin_recovery()
         if online and self._online is False:
             self.generation += 1
-            self.recovery_until = max(self.recovery_until, self.clock() + random.uniform(300, 900))
+            self.begin_recovery()
+        if self.store and online != self._online:
+            await self.store.call("set", "connection-online:" + self.platform_id, online)
         self._online = online
+        await self.persist_recovery()
         return online
 
     async def group(self, gid):
@@ -246,11 +281,16 @@ class Adapter:
 
 
 class Router:
-    def __init__(self, context, store=None):
+    def __init__(self, context, store=None, *, pace=Pace):
         self.context = context
         self.adapters = {}
         self.lock = asyncio.Lock()
         self.store = store
+        self.pace = pace
+
+    async def persist_recovery(self):
+        for adapter in self.adapters.values():
+            await adapter.persist_recovery()
 
     def platforms(self):
         manager = self.context.platform_manager
@@ -284,7 +324,12 @@ class Router:
                 pid = str(meta.id)
                 adapter = self.adapters.get(pid)
                 if adapter is None or adapter.bot is not platform.bot:
-                    adapter = self.adapters[pid] = Adapter(pid, platform.bot, store=self.store)
+                    if adapter is not None:
+                        adapter.begin_recovery()
+                        await adapter.persist_recovery()
+                    adapter = self.adapters[pid] = Adapter(
+                        pid, platform.bot, store=self.store, pace=self.pace
+                    )
                 try:
                     if (
                         policy.bot_qq

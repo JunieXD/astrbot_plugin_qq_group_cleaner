@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from .config import identifier, integer
-from .executor import CHINA, Executor
+from .executor import CHINA, Executor, scheduled_wait, wait_message
 from .platform import read_priority
 from .rules import evaluate
 from .service import scope
@@ -152,7 +152,10 @@ class Commands:
                 )
             if action == "恢复":
                 await s.resume(account, gid, actor)
-                return "已恢复。先等待 5～15 分钟，再按当前配置重新检查；旧计划已作废。"
+                until, reason = await scheduled_wait(
+                    s.store, account, gid, connection_until=adapter.recovery_until
+                )
+                return "已恢复，旧计划已作废。" + wait_message(reason, until) + "仍需满足执行时段和额度。"
             if action == "解释":
                 uid = identifier(parts[2], "QQ号")
                 member = await adapter.member(gid, uid)
@@ -196,10 +199,11 @@ class Commands:
         check_error = await s.store.call("get", "check-error:" + gid, "")
         unresolved = await s.store.call("unresolved", account, gid)
         used_account, used_group = await s.store.call("quota", account, gid, s.clock())
-        waiting_until = max(
-            await s.store.call("get", "startup_until", 0),
-            await s.store.call("get", "batch:" + key, 0),
-            await s.store.call("get", "cooldown:" + account, 0),
+        waiting_until, waiting_reason = await scheduled_wait(
+            s.store,
+            account,
+            gid,
+            connection_until=adapter.recovery_until,
         )
         latest = await s.store.call("latest", account, gid)
         lines = [
@@ -215,7 +219,7 @@ class Commands:
                 f"最近计划：{latest['id']}，候选 {latest['eligible']} 人，待补资料 {latest['waiting']} 人。"
             )
         if waiting_until > s.clock():
-            lines.append(f"最早下一批时间：{date_text(waiting_until)}（仍需满足执行时段和额度）。")
+            lines.append(wait_message(waiting_reason, waiting_until) + "仍需满足执行时段和额度。")
         if s.failure or group_pause or account_pause or check_error:
             lines.append("暂停原因：" + (s.failure or group_pause or account_pause or check_error))
         else:

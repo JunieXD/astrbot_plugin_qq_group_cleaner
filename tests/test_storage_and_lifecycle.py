@@ -47,7 +47,7 @@ async def test_startup_delay_persistent_and_stop_cancels_scheduler(env):
     env.box.settings = replace(env.box.settings, enabled=False)
     await env.service.start()
     until = await env.store.call("get", "startup_until")
-    assert env.clock() + 300 <= until <= env.clock() + 900
+    assert env.clock() + 30 <= until <= env.clock() + 90
     await env.service.stop()
     assert env.service.task.done()
     assert not env.adapter.kicks

@@ -124,6 +124,12 @@ class Store:
         with self.db:
             self._set(key, value)
 
+    def extend_deadline(self, key, until):
+        with self.db:
+            until = max(self.get(key, 0), until)
+            self._set(key, until)
+        return until
+
     def _audit(self, now, account, gid, kind, detail):
         self.db.execute(
             "INSERT INTO audit(at,account,gid,kind,detail) VALUES(?,?,?,?,?)",

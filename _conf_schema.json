@@ -79,6 +79,10 @@
       "batch_minutes": {"description": "两批至少间隔几分钟", "type": "int", "default": 60, "hint": "30～1440分钟，每群分别计算。"},
       "min_delay": {"description": "每人操作前最短等待秒数", "type": "int", "default": 30, "hint": "10～600秒，每次随机抽取。"},
       "max_delay": {"description": "每人操作前最长等待秒数", "type": "int", "default": 90, "hint": "不能小于最短等待，最多600秒。"},
+      "startup_min_seconds": {"description": "普通启动/重载最短缓冲秒数", "type": "int", "default": 30, "hint": "0～600秒；与最长值之间随机抽取。只影响普通启动或保存配置后的重载，不影响恢复冷却和批次间隔。两项都填0可关闭这项缓冲。"},
+      "startup_max_seconds": {"description": "普通启动/重载最长缓冲秒数", "type": "int", "default": 90, "hint": "不能小于最短值，最多600秒。默认普通重载只缓冲30～90秒。"},
+      "recovery_min_seconds": {"description": "连接或异常恢复最短冷却秒数", "type": "int", "default": 300, "hint": "30～3600秒；检测到断线重连、网络异常或使用恢复命令时生效。默认300～900秒，即5～15分钟。异常暂停仍需人工处理，不会到时自动解除。"},
+      "recovery_max_seconds": {"description": "连接或异常恢复最长冷却秒数", "type": "int", "default": 900, "hint": "不能小于最短值，最多3600秒。已有的等待截止时间不会因重载或调小参数而提前；共享操作队列可能另有等待。"},
       "start_hour": {"description": "每天几点开始允许清理", "type": "int", "default": 9, "hint": "北京时间0～23点；默认09:00开始。"},
       "end_hour": {"description": "每天几点停止清理", "type": "int", "default": 22, "hint": "北京时间0～24点；默认22:00停止。全天填0～24，跨午夜可填22～6。"}
     }

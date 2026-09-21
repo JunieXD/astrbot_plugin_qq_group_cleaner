@@ -1,5 +1,11 @@
 {
   "enabled": false,
+  "pace": {
+    "startup_min_seconds": 30,
+    "startup_max_seconds": 90,
+    "recovery_min_seconds": 300,
+    "recovery_max_seconds": 900
+  },
   "groups": [
     {
       "__template_key": "group",

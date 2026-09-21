@@ -94,6 +94,10 @@ class Pace:
     batch_minutes: int = 60
     start_hour: int = 9
     end_hour: int = 22
+    startup_min_seconds: int = 30
+    startup_max_seconds: int = 90
+    recovery_min_seconds: int = 300
+    recovery_max_seconds: int = 900
 
 
 @dataclass(frozen=True)
@@ -207,6 +211,10 @@ def parse_settings(raw: dict) -> Settings:
     if not isinstance(pace_raw, dict):
         raise CleanerError("执行节奏格式不正确。")
     bounds = {
+        "startup_min_seconds": (0, 600),
+        "startup_max_seconds": (0, 600),
+        "recovery_min_seconds": (30, 3600),
+        "recovery_max_seconds": (30, 3600),
         "min_delay": (10, 600),
         "max_delay": (10, 600),
         "batch_size": (1, 10),
@@ -217,6 +225,10 @@ def parse_settings(raw: dict) -> Settings:
         "end_hour": (0, 24),
     }
     labels = {
+        "startup_min_seconds": "普通启动/重载最短缓冲秒数",
+        "startup_max_seconds": "普通启动/重载最长缓冲秒数",
+        "recovery_min_seconds": "连接或异常恢复最短冷却秒数",
+        "recovery_max_seconds": "连接或异常恢复最长冷却秒数",
         "min_delay": "最短等待秒数",
         "max_delay": "最长等待秒数",
         "batch_size": "每批人数",
@@ -234,6 +246,9 @@ def parse_settings(raw: dict) -> Settings:
     )
     if pace.min_delay > pace.max_delay:
         raise CleanerError("最短等待不能大于最长等待。")
+    for kind, label in (("startup", "普通启动/重载缓冲"), ("recovery", "连接或异常恢复冷却")):
+        if getattr(pace, kind + "_min_seconds") > getattr(pace, kind + "_max_seconds"):
+            raise CleanerError(f"{label}：最短等待不能大于最长等待。")
     if pace.start_hour == pace.end_hour:
         raise CleanerError("执行时段起止不能相同；全天请填 0～24。")
     return Settings(boolean(raw, "enabled", False), tuple(groups), pace)
