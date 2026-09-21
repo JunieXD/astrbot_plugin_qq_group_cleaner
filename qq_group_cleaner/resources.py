@@ -15,12 +15,13 @@ from .config import CleanerError
 class InstanceLock:
     def __init__(self, path: Path):
         self.file = path.open("a+b")
-        self.file.seek(0)
-        if not self.file.read(1):
-            self.file.write(b"0")
-            self.file.flush()
-        self.file.seek(0)
         try:
+            # Windows mandatory byte locks also prohibit reading an already locked byte.
+            # Inspect metadata instead; all owners lock offset zero even on first-create races.
+            if os.fstat(self.file.fileno()).st_size == 0:
+                self.file.write(b"0")
+                self.file.flush()
+            self.file.seek(0)
             if os.name == "nt":
                 import msvcrt
 

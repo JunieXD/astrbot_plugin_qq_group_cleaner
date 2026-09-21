@@ -225,6 +225,19 @@ async def test_details_failure_does_not_count_as_absence_or_kick(env):
     assert not await env.store.call("history", ACCOUNT, GROUP)
 
 
+@pytest.mark.parametrize("muted", [True, None])
+async def test_all_group_mute_blocks_planning_and_last_minute_execution(env, muted):
+    env.adapter.all_muted = muted
+    with pytest.raises(CleanerError, match="全员禁言"):
+        await plan_for(env)
+    env.adapter.all_muted = False
+    plan = await plan_for(env)
+    env.adapter.all_muted = muted
+    with pytest.raises(CleanerError, match="全员禁言"):
+        await Executor(env.service).execute(plan, env.adapter)
+    assert not env.adapter.kicks
+
+
 async def test_same_plan_cannot_execute_twice_concurrently(env):
     plan = await plan_for(env)
     results = await asyncio.gather(

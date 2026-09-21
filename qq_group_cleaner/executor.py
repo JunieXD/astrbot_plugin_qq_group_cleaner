@@ -171,6 +171,7 @@ class Executor:
             )
             return "skip"
         info = await adapter.group(gid)
+        info.check_speaking(policy.protect_muted)
         if policy.trigger > info.capacity:
             raise CleanerError("群容量发生变化，请调整人数配置。")
         if info.count <= policy.target:

@@ -20,6 +20,11 @@ class PlatformError(CleanerError):
 class GroupInfo:
     count: int
     capacity: int
+    all_muted: bool | None = None
+
+    def check_speaking(self, protect_muted):
+        if protect_muted and self.all_muted is not False:
+            raise PlatformError("群正在全员禁言或全员禁言状态未知，暂缓清理。")
 
 
 class Adapter:
@@ -75,16 +80,17 @@ class Adapter:
 
     async def group(self, gid):
         # NapCat's ordinary group_info is cached. The detail extension is mandatory.
-        data = await self.call("get_group_detail_info", group_id=int(gid))
+        data = await self.call("get_group_detail_info", group_id=gid)
         if not isinstance(data, dict):
             raise PlatformError("群人数数据格式不正确，请使用支持群详情接口的 NapCat。")
         count, capacity = number(data.get("member_count")), number(data.get("max_member_count"))
         if not count or not capacity or count > capacity:
             raise PlatformError("群人数或容量数据异常，暂不清理。")
-        return GroupInfo(count, capacity)
+        all_shut = str(data.get("group_all_shut"))
+        return GroupInfo(count, capacity, all_shut != "0" if all_shut in ("-1", "0", "1") else None)
 
     async def members(self, gid):
-        data = await self.call("get_group_member_list", group_id=int(gid), no_cache=True)
+        data = await self.call("get_group_member_list", group_id=gid, no_cache=True)
         if not isinstance(data, list) or not data or len(data) > 10000:
             raise PlatformError("成员名单为空、过大或格式异常，暂不清理。")
         members = []
@@ -99,7 +105,7 @@ class Adapter:
         return members
 
     async def member(self, gid, uid):
-        data = await self.call("get_group_member_info", group_id=int(gid), user_id=int(uid), no_cache=True)
+        data = await self.call("get_group_member_info", group_id=gid, user_id=uid, no_cache=True)
         if (
             not isinstance(data, dict)
             or str(data.get("user_id")) != uid
@@ -121,8 +127,8 @@ class Adapter:
     async def kick(self, gid, uid, *, before_send=None):
         return await self.call(
             "set_group_kick",
-            group_id=int(gid),
-            user_id=int(uid),
+            group_id=gid,
+            user_id=uid,
             reject_add_request=False,
             before_send=before_send,
         )

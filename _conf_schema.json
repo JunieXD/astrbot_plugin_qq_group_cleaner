@@ -46,7 +46,7 @@
               "max_qq_level": {"description": "只考虑QQ等级不高于多少的人", "type": "int", "default": 0,
                 "hint": "0表示不限制。QQ等级会分轮补查，资料不足时不执行。"},
               "protect_title": {"description": "保留有群专属头衔的人", "type": "bool", "default": true},
-              "protect_muted": {"description": "保留正在被禁言的人", "type": "bool", "default": true},
+              "protect_muted": {"description": "保留正在被禁言的人", "type": "bool", "default": true, "hint": "开启后，全员禁言或其状态不明时也会暂缓整个群的清理。"},
               "custom_order": {"description": "自定义清理顺序", "type": "list", "default": [],
                 "hint": "仅在先清理谁选择自定义时生效。按优先级逐项填写：群等级、未发言天数、QQ等级、未发言时长档位、入群时间。等级由低到高；未发言由久到近；入群由早到晚。可选一项或多项，不重复。"},
               "bot_qq": {"description": "负责这个群的机器人QQ（通常留空）", "type": "string", "default": "",

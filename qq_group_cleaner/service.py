@@ -113,6 +113,7 @@ class CleanerService:
         settings = self.settings()
         gid, account = policy.group_id, adapter.account
         info = await adapter.group(gid)
+        info.check_speaking(policy.protect_muted)
         if policy.trigger > info.capacity:
             raise CleanerError("开始人数超过实际群容量，请调整这个群的配置。")
         triggered = await self.cycle(
@@ -132,6 +133,7 @@ class CleanerService:
             )
             return None
         info, members = await adapter.snapshot(gid)
+        info.check_speaking(policy.protect_muted)
         # Recompute using the count belonging to the snapshot, not the earlier count.
         triggered = await self.cycle(
             policy,

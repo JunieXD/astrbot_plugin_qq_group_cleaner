@@ -50,7 +50,7 @@ async def test_kick_only_uses_ordinary_removal_and_never_retries():
     with pytest.raises(PlatformError):
         await api.kick(GROUP, "200001")
     assert api.bot.calls == [
-        ("set_group_kick", {"group_id": int(GROUP), "user_id": 200001, "reject_add_request": False})
+        ("set_group_kick", {"group_id": GROUP, "user_id": "200001", "reject_add_request": False})
     ]
 
 
@@ -94,6 +94,16 @@ async def test_read_budget_and_status():
     api.reads.extend([api.clock()] * 180)
     with pytest.raises(PlatformError, match="上限"):
         await api.online()
+
+
+@pytest.mark.parametrize("raw, expected", [(-1, True), (0, False), (None, None)])
+async def test_napcat_group_mute_mapping_and_string_identifiers(raw, expected):
+    api = adapter(
+        {"get_group_detail_info": {"member_count": 5, "max_member_count": 500, "group_all_shut": raw}}
+    )
+    group = await api.group(GROUP)
+    assert group.all_muted is expected
+    assert api.bot.calls[0][1]["group_id"] == GROUP
 
 
 async def test_ambiguous_and_duplicate_accounts_rejected():

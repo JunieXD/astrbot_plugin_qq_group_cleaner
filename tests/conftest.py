@@ -65,6 +65,7 @@ class FakeAdapter:
         self.detail_hook = None
         self.kick_hook = None
         self.snapshot_calls = 0
+        self.all_muted = False
 
     async def identity(self):
         return self.account
@@ -73,7 +74,7 @@ class FakeAdapter:
         return self.connected
 
     async def group(self, gid):
-        return GroupInfo(len(self.people), 500)
+        return GroupInfo(len(self.people), 500, self.all_muted)
 
     async def snapshot(self, gid):
         self.snapshot_calls += 1
