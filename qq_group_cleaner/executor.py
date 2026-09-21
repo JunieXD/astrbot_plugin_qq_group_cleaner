@@ -7,6 +7,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 from .config import CleanerError, Deferred
+from .platform import read_priority
 from .rules import Member, evaluate
 from .service import scope
 
@@ -43,7 +44,7 @@ class Executor:
             raise CleanerError("本群已暂停，恢复后请重新预览。")
         if await self.store.call("get", "account-pause:" + plan["account"], ""):
             raise CleanerError("此账号已暂停；请核对历史中的异常记录，再使用恢复命令。")
-        if await self.store.call("unresolved", plan["account"], plan["gid"]):
+        if await self.store.call("unresolved_account", plan["account"]):
             raise CleanerError("存在结果不明的操作，需先核对或保留成员。")
         until = max(
             await self.store.call("get", "startup_until", 0),
@@ -61,11 +62,24 @@ class Executor:
         return policy, settings
 
     async def execute(self, plan, adapter):
+        try:
+            await self._execute(plan, adapter)
+        finally:
+            if adapter.recovery_until:
+                prior = await self.store.call("get", "cooldown:" + adapter.account, 0)
+                await self.store.call(
+                    "set", "cooldown:" + adapter.account, max(prior, adapter.recovery_until)
+                )
+
+    async def _execute(self, plan, adapter):
         s = self.s
         if (adapter.account, adapter.platform_id) != (plan["account"], plan["platform"]):
             raise CleanerError("机器人账号绑定已改变，请重新预览。")
         lock = s.account_locks.setdefault(adapter.account, asyncio.Lock())
         async with lock:
+            self.check_binding(plan, adapter)
+            if adapter.recovery_until > s.clock():
+                raise Deferred("连接刚恢复，等待冷却后重新检查。", adapter.recovery_until)
             policy, settings = await self.gate(plan, first=True)
             await self.store.call("plan_state", plan["id"], "running")
             await self.store.call(
@@ -85,7 +99,12 @@ class Executor:
                     guard = s.router.shared_guard()
 
                     async def action():
-                        return await self.one(plan, adapter, Member(**item["member"]))
+                        with read_priority(1):
+                            return await self.one(plan, adapter, Member(**item["member"]))
+
+                    async def online():
+                        with read_priority(1):
+                            return await adapter.online()
 
                     if guard is None:
                         result = await action()
@@ -93,7 +112,7 @@ class Executor:
                         try:
                             result = await guard.run(
                                 account=adapter.platform_id,
-                                online=adapter.online,
+                                online=online,
                                 action=action,
                                 config={
                                     "recovery_min_seconds": 300,
@@ -113,9 +132,16 @@ class Executor:
                 # Cancellation still completes the DB write via Store.call's shield.
                 await self.store.call("plan_state", plan["id"], "finished")
 
-    def volatile_check(self, plan, adapter, uid, versions):
+    def check_binding(self, plan, adapter):
+        if self.s.router.binding_stamp(adapter) != plan.get("binding"):
+            raise CleanerError("机器人连接或接入配置已改变，旧计划失效，请重新预览。")
+
+    def volatile_check(self, plan, adapter, uid, versions, verified_at):
         s = self.s
         s.healthy()
+        self.check_binding(plan, adapter)
+        if s.monotonic() - verified_at > 30:
+            raise CleanerError("资料核验或接口排队耗时过长，本次取消，等待重新检查。")
         if s.settings().revision != plan["revision"] or s.clock() >= plan["expires"]:
             raise CleanerError("等待期间配置或计划有效期发生变化，已取消。")
         if scope(adapter.account, plan["gid"]) in s.memory_pauses:
@@ -139,15 +165,15 @@ class Executor:
             await self.store.call("set", "cooldown:" + account, s.clock() + random.uniform(300, 900))
             raise CleanerError("QQ 当前离线，已停止执行并进入恢复冷却。")
         await adapter.identity()
+        self.check_binding(plan, adapter)
+        verified_at = s.monotonic()
         if policy.mode == "确认后清理":
-            approver = await adapter.member(gid, current_plan["approver"])
-            if approver.role not in ("owner", "admin"):
+            if not await s.is_admin(adapter, gid, current_plan["approver"]):
                 raise CleanerError("确认人已不再是本群管理员，原计划失效。")
-        bot = await adapter.member(gid, account)
-        if bot.role not in ("owner", "admin"):
+        if not await s.is_admin(adapter, gid, account):
             raise CleanerError("机器人不是本群管理员，已停止执行。")
         fresh = await adapter.member(gid, original.user_id)
-        fresh = (await self.store.call("merge", account, gid, [fresh]))[0]
+        fresh = (await self.store.call("merge", account, gid, [fresh], s.clock()))[0]
         protected, attempted = await self.store.call("exclusions", account, gid, s.clock())
         decision = evaluate(
             policy,
@@ -181,7 +207,7 @@ class Executor:
             raise CleanerError("清理周期已失效，请重新预览。")
         await self.gate(plan)
         try:
-            self.volatile_check(plan, adapter, fresh.user_id, versions)
+            self.volatile_check(plan, adapter, fresh.user_id, versions, verified_at)
         except CleanerError:
             return "skip"
         s.journal.record("准备提交", plan["id"])
@@ -198,7 +224,7 @@ class Executor:
 
         def before_send():
             nonlocal sent
-            self.volatile_check(plan, adapter, fresh.user_id, versions)
+            self.volatile_check(plan, adapter, fresh.user_id, versions, verified_at)
             sent = True
 
         try:
@@ -210,11 +236,17 @@ class Executor:
                 await self.store.call(
                     "result", operation_id, "unknown", "请求中断或返回异常，不重复提交", s.clock()
                 )
-                await self.store.call("set", "account-pause:" + account, "管理请求中断或返回异常，需人工核对")
+                await self.store.call(
+                    "set",
+                    "account-pause:" + account,
+                    {"gid": gid, "reason": "管理请求中断或返回异常，需人工核对"},
+                )
             raise
         state = await self.verify(adapter, operation_id)
         if state == "unknown":
-            await self.store.call("set", "account-pause:" + account, "移出结果不明，需核对或保留")
+            await self.store.call(
+                "set", "account-pause:" + account, {"gid": gid, "reason": "移出结果不明，需核对或保留"}
+            )
             raise CleanerError("移出结果不明，已暂停账号；请查看历史，核对后再恢复。")
         s.journal.record("操作核验完成", f"{plan['id']} {state}")
         return state

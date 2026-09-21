@@ -1,7 +1,7 @@
 name: astrbot_plugin_qq_group_cleaner
 desc: 群人数达到设定值时，按未发言时间和等级规则分批清理，支持预览、确认和自动模式。
 help: 先在配置中添加群，然后私聊机器人发送 /群清理 预览 群号。发送 /群清理 查看帮助。
-version: v0.1.0
+version: v0.1.1
 author: JunieXD
 repo: https://github.com/JunieXD/astrbot_plugin_qq_group_cleaner
 display_name: QQ 群成员清理

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from .config import identifier, integer
 from .executor import CHINA, Executor
+from .platform import read_priority
 from .rules import evaluate
 from .service import scope
 
@@ -149,7 +150,7 @@ class Commands:
             if action == "解释":
                 uid = identifier(parts[2], "QQ号")
                 member = await adapter.member(gid, uid)
-                member = (await s.store.call("merge", account, gid, [member]))[0]
+                member = (await s.store.call("merge", account, gid, [member], s.clock()))[0]
                 protected, attempted = await s.store.call("exclusions", account, gid, s.clock())
                 decision = evaluate(
                     policy, member, s.clock(), account, uid in protected or (uid, member.epoch) in attempted
@@ -165,7 +166,8 @@ class Commands:
                     return "本群没有结果不明的操作。"
                 results = []
                 for op in unresolved[:10]:
-                    state = await Executor(s).verify(adapter, op["id"])
+                    with read_priority(2):
+                        state = await Executor(s).verify(adapter, op["id"])
                     results.append(f"{op['uid']}：{STATES[state]}")
                 return "\n".join(results) + "\n核对不会重发移出请求。确认处理完毕后使用恢复命令。"
             if action == "保留":
@@ -189,6 +191,10 @@ class Commands:
         status = await s.store.call("get", "status:" + key, {})
         group_pause = await s.store.call("get", "pause:" + key, "")
         account_pause = await s.store.call("get", "account-pause:" + account, "")
+        if isinstance(account_pause, dict):
+            account_pause = (
+                account_pause["reason"] if account_pause.get("gid") == gid else "账号因其他群的操作暂停"
+            )
         check_error = await s.store.call("get", "check-error:" + gid, "")
         unresolved = await s.store.call("unresolved", account, gid)
         used_account, used_group = await s.store.call("quota", account, gid, s.clock())

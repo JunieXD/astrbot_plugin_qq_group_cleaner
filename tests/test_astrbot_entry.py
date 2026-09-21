@@ -1,5 +1,6 @@
 """Exercise the plugin boundary without importing a running AstrBot singleton."""
 
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -101,3 +102,40 @@ async def test_private_help_responds_without_network_or_llm(entry):
         assert stopped == [True]
     finally:
         await plugin.terminate()
+
+
+async def test_cancelling_initialization_releases_database_and_instance_lock(entry, monkeypatch):
+    plugin_cls, _ = entry
+    module = sys.modules[plugin_cls.__module__]
+    entered = asyncio.Event()
+
+    async def start(service):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(module.CleanerService, "start", start)
+    plugin = plugin_cls(SimpleNamespace(platform_manager=SimpleNamespace(get_insts=lambda: [])), {})
+    task = asyncio.create_task(plugin.initialize())
+    await entered.wait()
+    store = plugin.store
+    lock_path = store.path.parent / "instance.lock"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.closed and plugin.service is None
+    module.InstanceLock(lock_path).close()
+
+
+async def test_log_close_failure_does_not_leak_instance_lock(entry):
+    plugin_cls, _ = entry
+    plugin = plugin_cls(SimpleNamespace(), {})
+    released = []
+
+    def fail():
+        raise OSError("disk unavailable")
+
+    plugin.journal = SimpleNamespace(close=fail)
+    plugin.lock = SimpleNamespace(close=lambda: released.append(True))
+    with pytest.raises(OSError):
+        await plugin.terminate()
+    assert released == [True] and plugin.lock is None

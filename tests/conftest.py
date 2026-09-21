@@ -66,6 +66,7 @@ class FakeAdapter:
         self.kick_hook = None
         self.snapshot_calls = 0
         self.all_muted = False
+        self.recovery_until = 0
 
     async def identity(self):
         return self.account
@@ -103,12 +104,16 @@ class FakeRouter:
     def __init__(self, adapter):
         self.adapter = adapter
         self.guard = None
+        self.binding = "test-connection"
 
     async def resolve(self, policy):
         return self.adapter
 
     def shared_guard(self):
         return self.guard
+
+    def binding_stamp(self, adapter):
+        return self.binding
 
 
 class FakeJournal:

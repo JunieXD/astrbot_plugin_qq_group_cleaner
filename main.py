@@ -16,7 +16,7 @@ from .qq_group_cleaner.service import CleanerService
 from .qq_group_cleaner.store import Store
 
 
-@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.1.0")
+@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.1.1")
 class QQGroupCleaner(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context=context, config=config)
@@ -38,11 +38,13 @@ class QQGroupCleaner(Star):
             self.journal = Journal(root)
             self.store = Store(root / "state.sqlite3")
             await self.store.call("open_db")
-            self.service = CleanerService(self.settings, self.store, Router(self.context), self.journal)
+            self.service = CleanerService(
+                self.settings, self.store, Router(self.context, self.store), self.journal
+            )
             await self.service.start()
             self.start_error = ""
-            logger.info("QQ 群清理 v0.1.0 已加载；默认只预览，配置中启用后开始检查。")
-        except Exception as exc:
+            logger.info("QQ 群清理 v0.1.1 已加载；默认只预览，配置中启用后开始检查。")
+        except BaseException as exc:
             self.start_error = (
                 str(exc)
                 if isinstance(exc, CleanerError)
@@ -50,6 +52,8 @@ class QQGroupCleaner(Star):
             )
             logger.error("QQ 群清理：%s [%s]", self.start_error, type(exc).__name__)
             await self.terminate()
+            if not isinstance(exc, Exception):
+                raise
 
     async def terminate(self):
         try:
@@ -60,11 +64,15 @@ class QQGroupCleaner(Star):
                 if self.store:
                     await self.store.close()
             finally:
-                if self.journal:
-                    self.journal.close()
-                if self.lock:
-                    self.lock.close()
-                self.service = self.store = self.journal = self.lock = None
+                try:
+                    if self.journal:
+                        self.journal.close()
+                finally:
+                    try:
+                        if self.lock:
+                            self.lock.close()
+                    finally:
+                        self.service = self.store = self.journal = self.lock = None
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)

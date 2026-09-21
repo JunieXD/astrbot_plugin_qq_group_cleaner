@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
-from .config import CleanerError
+from .config import CleanerError, Deferred
 from .rules import Member
 
 
@@ -20,9 +21,11 @@ class Store:
         self.pending = 0
         self.healthy = True
         self.closed = False
+        self.closing = False
+        self.close_lock = asyncio.Lock()
 
     async def call(self, method: str, *args):
-        if self.closed or (not self.healthy and method != "close_db"):
+        if self.closed or ((self.closing or not self.healthy) and method != "close_db"):
             raise CleanerError("审计存储不可用，已停止清理，请检查磁盘和插件日志。")
         self.pending += 1
         if self.pending > 512:
@@ -43,11 +46,15 @@ class Store:
             self.pending -= 1
 
     async def close(self):
-        try:
-            await self.call("close_db")
-        finally:
-            self.closed = True
-            self.worker.shutdown(wait=True)
+        async with self.close_lock:
+            if self.closed:
+                return
+            self.closing = True
+            try:
+                await self.call("close_db")
+            finally:
+                self.closed = True
+                self.worker.shutdown(wait=True)
 
     def open_db(self):
         self.db = sqlite3.connect(self.path, timeout=5)
@@ -56,7 +63,7 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise CleanerError("数据库来自更新的插件版本，请升级插件，不要删除数据库。")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -79,7 +86,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY, at REAL, account TEXT, gid TEXT, kind TEXT, detail TEXT);
             CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, at REAL);
-            PRAGMA user_version=1;
+            PRAGMA user_version=2;
         """)
         with self.db:
             self.db.execute(
@@ -89,8 +96,10 @@ class Store:
 
     def close_db(self):
         if hasattr(self, "db"):
-            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self.db.close()
+            try:
+                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                self.db.close()
 
     def get(self, key: str, default=None):
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
@@ -116,7 +125,14 @@ class Store:
         with self.db:
             self._audit(now, account, gid, kind, detail)
 
-    def merge(self, account: str, gid: str, members: list[Member]) -> list[Member]:
+    def _clear_role_before_join(self, account, gid, uid, joined):
+        key = f"role-notice:{account}:{gid}:{uid}"
+        notice = self.get(key, {})
+        if joined > notice.get("at", 0):
+            self._set(key, {})
+
+    def merge(self, account: str, gid: str, members: list[Member], now=None) -> list[Member]:
+        now = time.time() if now is None else now
         result = []
         with self.db:
             for member in members:
@@ -127,17 +143,46 @@ class Store:
                 epoch = row["epoch"] if row else 1
                 activity = row["activity"] if row else 0
                 event_at = row["event_at"] if row else 0
-                joined = member.joined
-                if row and (joined != row["joined"] or not row["present"]):
-                    epoch += 1
-                    # Never erase positive recent-event evidence because a cached list disagrees.
+                joined = row["joined"] if row else None
+                present = row["present"] if row else 1
+                incoming = member.joined
+                valid_join = incoming is not None and 0 < incoming <= now + 300
+                known = valid_join
+                if present == 2:  # An increase notice awaits a matching platform join timestamp.
+                    known = valid_join and incoming >= event_at - 300
+                    if known:
+                        joined, present = incoming, 1
+                elif present == 0:
+                    # A cached old member must never resurrect a membership that has ended.
+                    known = (
+                        valid_join and incoming >= event_at - 300 and (joined is None or incoming > joined)
+                    )
+                    if known:
+                        joined, present, epoch = incoming, 1, epoch + 1
+                        activity = max(activity, now)
+                        self._clear_role_before_join(account, gid, member.user_id, incoming)
+                elif valid_join:
+                    if joined is None:
+                        joined = incoming
+                    elif incoming > joined:
+                        joined, epoch = incoming, epoch + 1
+                        activity = max(activity, now)  # New membership or uncertain timestamp correction.
+                        self._clear_role_before_join(account, gid, member.user_id, incoming)
+                    elif incoming < joined:
+                        known = False  # Do not rewind canonical identity or release attempt deduplication.
+                if member.last_sent and 0 < member.last_sent <= now + 300:
+                    activity = max(activity, member.last_sent)
                 self.db.execute(
-                    """INSERT INTO members VALUES(?,?,?,?,?,?,?,1)
+                    """INSERT INTO members VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(account,gid,uid) DO UPDATE SET joined=excluded.joined,
-                    epoch=excluded.epoch,activity=excluded.activity,present=1""",
-                    (account, gid, member.user_id, joined, epoch, activity, event_at),
+                    epoch=excluded.epoch,activity=excluded.activity,present=excluded.present""",
+                    (account, gid, member.user_id, joined, epoch, activity, event_at, present),
                 )
-                result.append(replace(member, epoch=epoch, activity=activity))
+                role_notice = self.get(f"role-notice:{account}:{gid}:{member.user_id}", {})
+                role = "admin" if role_notice.get("role") == "admin" else member.role
+                result.append(
+                    replace(member, epoch=epoch, activity=activity, membership_known=known, role=role)
+                )
         return result
 
     def observe(self, account, gid, uid, kind, occurred, received, fingerprint, operator="", subtype=""):
@@ -159,11 +204,19 @@ class Store:
             if kind in ("message", "group_increase", "group_admin"):
                 activity = max(activity, occurred, received)  # late notices still protect
             if kind in ("group_increase", "group_decrease") and occurred >= event_at:
-                epoch += 1
                 event_at = occurred
-                present = int(kind == "group_increase")
-                if present:
-                    joined = int(occurred)
+                present = 2 if kind == "group_increase" else 0
+                if present == 2:
+                    epoch += 1
+            notice_key = f"role-notice:{account}:{gid}:{uid}"
+            previous_notice = self.get(notice_key, {})
+            if occurred >= previous_notice.get("at", 0):
+                if kind == "group_admin" and subtype in ("set", "unset"):
+                    self._set(notice_key, {"at": occurred, "role": "admin" if subtype == "set" else "member"})
+                elif kind == "group_decrease":
+                    self._set(notice_key, {"at": occurred, "role": "absent"})
+                elif kind == "group_increase":
+                    self._set(notice_key, {"at": occurred})
             self.db.execute(
                 """INSERT INTO members VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account,gid,uid)
                 DO UPDATE SET joined=excluded.joined,epoch=excluded.epoch,activity=excluded.activity,
@@ -260,6 +313,15 @@ class Store:
         ).fetchone()
         return row[0], row[1]
 
+    def reserve_read(self, platform, now, limit):
+        with self.db:
+            key = "reads:" + platform
+            times = [stamp for stamp in self.get(key, []) if stamp > now - 3600]
+            if len(times) >= limit:
+                raise Deferred("本小时资料读取已达上限，稍后再检查。", min(times) + 3601)
+            times.append(now)
+            self._set(key, times)
+
     def unresolved(self, account, gid):
         return [
             dict(r)
@@ -277,6 +339,16 @@ class Store:
             )
         ]
 
+    def pause_owner(self, account):
+        pause = self.get("account-pause:" + account, "")
+        if isinstance(pause, dict):
+            return pause.get("gid")
+        # v0.1.0 stored a string, always after creating the corresponding operation.
+        row = self.db.execute(
+            "SELECT gid FROM operations WHERE account=? ORDER BY submitted DESC,id DESC LIMIT 1", (account,)
+        ).fetchone()
+        return row[0] if row else None
+
     def reserve(self, plan_id, member, now, group_limit, account_limit):
         """Intent, attempt quota and uniqueness commit together BEFORE the network write."""
         with self.db:
@@ -287,8 +359,26 @@ class Store:
             used_account, used_group = self.quota(account, gid, now)
             if used_account >= account_limit or used_group >= group_limit:
                 raise CleanerError("已达到最近 24 小时清理上限，等待额度恢复。")
-            if self.unresolved(account, gid):
+            if self.unresolved_account(account):
                 raise CleanerError("有结果不明的操作，需先核对或保留该成员。")
+            if not any(
+                item["member"]["user_id"] == member.user_id and item["member"]["epoch"] == member.epoch
+                for item in plan["members"]
+            ):
+                raise CleanerError("成员不在本批已授权名单中。")
+            current = self.db.execute(
+                "SELECT * FROM members WHERE account=? AND gid=? AND uid=?", (account, gid, member.user_id)
+            ).fetchone()
+            if (
+                not current
+                or current["present"] != 1
+                or current["epoch"] != member.epoch
+                or current["joined"] != member.joined
+                or current["activity"] > member.activity
+            ):
+                raise CleanerError("成员身份或活动已变化，取消本次提交。")
+            if member.user_id in self.exclusions(account, gid, now)[0]:
+                raise CleanerError("成员刚被加入保护名单，取消本次提交。")
             try:
                 cursor = self.db.execute(
                     """INSERT INTO operations(plan,account,gid,uid,epoch,submitted,state,reason)

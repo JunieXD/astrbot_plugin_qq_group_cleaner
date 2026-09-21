@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import ACCOUNT, GROUP, Clock
 
-from qq_group_cleaner.config import Policy
+from qq_group_cleaner.config import Deferred, Policy
 from qq_group_cleaner.platform import Adapter, PlatformError, Router
 
 
@@ -92,7 +92,7 @@ async def test_read_budget_and_status():
     api = adapter({"get_status": {"online": True}})
     assert await api.online()
     api.reads.extend([api.clock()] * 180)
-    with pytest.raises(PlatformError, match="上限"):
+    with pytest.raises(Deferred, match="上限"):
         await api.online()
 
 

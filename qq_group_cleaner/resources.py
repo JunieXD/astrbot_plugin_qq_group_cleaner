@@ -93,6 +93,10 @@ class Journal:
         self.check()
 
     def close(self):
-        self.handler.flush()
-        self.handler.close()
-        self.logger.removeHandler(self.handler)
+        try:
+            self.handler.flush()
+        finally:
+            try:
+                self.handler.close()
+            finally:
+                self.logger.removeHandler(self.handler)

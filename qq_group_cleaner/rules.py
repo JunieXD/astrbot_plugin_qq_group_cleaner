@@ -35,6 +35,7 @@ class Member:
     robot: bool = False
     activity: float = 0
     epoch: int = 0
+    membership_known: bool = True
 
     @classmethod
     def from_api(cls, raw: dict) -> Member:
@@ -78,6 +79,8 @@ def evaluate(
         return keep("在保护名单或本次入群已有处理记录")
     if member.robot:
         return keep("平台标记的机器人")
+    if not member.membership_known:
+        return keep("入群身份与已知记录冲突，等待资料更新")
     if not member.joined or not member.last_sent:
         return keep("入群时间或发言时间缺失，不能证明长期未发言")
     if max(member.joined, member.last_sent, member.activity) > now + 300:
