@@ -35,6 +35,8 @@ class Executor:
         current = await self.store.call("plan", plan["id"])
         if not settings.enabled or not policy.enabled or plan["revision"] != settings.revision:
             raise CleanerError("插件未启用或配置已变更，请重新预览。")
+        if policy.bot_qq and policy.bot_qq != plan["account"]:
+            raise CleanerError("群配置中的机器人绑定已改变，请重新预览。")
         if plan["expires"] <= now or current["state"] not in ("ready", "running"):
             raise CleanerError("计划已过期或停止，请重新预览。")
         if policy.mode == "仅预览" or (policy.mode == "确认后清理" and not current["approver"]):
@@ -158,6 +160,8 @@ class Executor:
         policy, settings = await self.gate(plan)
         current_plan = await self.store.call("plan", plan["id"])
         actors = {original.user_id, account}
+        if policy.protect_muted:
+            actors.add("0")  # OneBot uses user_id=0 for all-member mute notices.
         if current_plan["approver"]:
             actors.add(current_plan["approver"])
         versions = {uid: s.event_versions.get((account, gid, uid), 0) for uid in actors}
@@ -197,7 +201,7 @@ class Executor:
             )
             return "skip"
         info = await adapter.group(gid)
-        info.check_speaking(policy.protect_muted)
+        await s.check_speaking(policy, account, info)
         if policy.trigger > info.capacity:
             raise CleanerError("群容量发生变化，请调整人数配置。")
         if info.count <= policy.target:

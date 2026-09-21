@@ -1,3 +1,3 @@
 """QQ group cleanup: rules and runtime independent of AstrBot imports."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

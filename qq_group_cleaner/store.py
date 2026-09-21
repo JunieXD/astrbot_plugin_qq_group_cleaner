@@ -33,14 +33,23 @@ class Store:
             self.healthy = False
             raise CleanerError("活动记录积压，已停止清理，请重载插件后检查状态。")
         future = asyncio.get_running_loop().run_in_executor(self.worker, getattr(self, method), *args)
+        cancelled = False
         try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            # Finish any outstanding commit before the old instance can release its lock.
-            await asyncio.shield(future)
-            raise
+            # Reload and shutdown can both cancel the same task. Keep ownership of its
+            # outstanding transaction until it settles, including errors after cancellation.
+            while True:
+                try:
+                    result = await asyncio.shield(future)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
         except (sqlite3.Error, OSError) as exc:
             self.healthy = False
+            if cancelled:
+                raise asyncio.CancelledError from exc
             raise CleanerError("审计存储写入失败，已停止清理，请检查磁盘和插件日志。") from exc
         finally:
             self.pending -= 1
@@ -125,11 +134,12 @@ class Store:
         with self.db:
             self._audit(now, account, gid, kind, detail)
 
-    def _clear_role_before_join(self, account, gid, uid, joined):
-        key = f"role-notice:{account}:{gid}:{uid}"
-        notice = self.get(key, {})
-        if joined > notice.get("at", 0):
-            self._set(key, {})
+    def _clear_notices_before_join(self, account, gid, uid, joined):
+        for prefix in ("role-notice", "ban-notice"):
+            key = f"{prefix}:{account}:{gid}:{uid}"
+            notice = self.get(key, {})
+            if joined > notice.get("at", 0):
+                self._set(key, {})
 
     def merge(self, account: str, gid: str, members: list[Member], now=None) -> list[Member]:
         now = time.time() if now is None else now
@@ -160,18 +170,20 @@ class Store:
                     if known:
                         joined, present, epoch = incoming, 1, epoch + 1
                         activity = max(activity, now)
-                        self._clear_role_before_join(account, gid, member.user_id, incoming)
+                        self._clear_notices_before_join(account, gid, member.user_id, incoming)
                 elif valid_join:
                     if joined is None:
                         joined = incoming
                     elif incoming > joined:
                         joined, epoch = incoming, epoch + 1
                         activity = max(activity, now)  # New membership or uncertain timestamp correction.
-                        self._clear_role_before_join(account, gid, member.user_id, incoming)
+                        self._clear_notices_before_join(account, gid, member.user_id, incoming)
                     elif incoming < joined:
                         known = False  # Do not rewind canonical identity or release attempt deduplication.
                 if member.last_sent and 0 < member.last_sent <= now + 300:
                     activity = max(activity, member.last_sent)
+                if 0 < member.activity <= now + 300:
+                    activity = max(activity, member.activity)
                 self.db.execute(
                     """INSERT INTO members VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(account,gid,uid) DO UPDATE SET joined=excluded.joined,
@@ -180,12 +192,25 @@ class Store:
                 )
                 role_notice = self.get(f"role-notice:{account}:{gid}:{member.user_id}", {})
                 role = "admin" if role_notice.get("role") == "admin" else member.role
+                ban_notice = self.get(f"ban-notice:{account}:{gid}:{member.user_id}", {})
+                muted = member.muted_until
+                if muted is not None:
+                    muted = max(muted, ban_notice.get("until", 0))
                 result.append(
-                    replace(member, epoch=epoch, activity=activity, membership_known=known, role=role)
+                    replace(
+                        member,
+                        epoch=epoch,
+                        activity=activity,
+                        membership_known=known,
+                        role=role,
+                        muted_until=muted,
+                    )
                 )
         return result
 
-    def observe(self, account, gid, uid, kind, occurred, received, fingerprint, operator="", subtype=""):
+    def observe(
+        self, account, gid, uid, kind, occurred, received, fingerprint, operator="", subtype="", duration=0
+    ):
         with self.db:
             if fingerprint:
                 inserted = self.db.execute(
@@ -193,6 +218,14 @@ class Store:
                 )
                 if not inserted.rowcount:
                     return
+            if kind == "group_ban":
+                key = f"ban-notice:{account}:{gid}:{uid}"
+                previous = self.get(key, {})
+                if occurred >= previous.get("at", 0):
+                    # user_id=0 denotes all-member mute; it lasts until a lift notice.
+                    until = occurred + duration if subtype == "ban" else 0
+                    self._set(key, {"at": occurred, "until": until, "active": subtype == "ban"})
+                return
             row = self.db.execute(
                 "SELECT * FROM members WHERE account=? AND gid=? AND uid=?", (account, gid, uid)
             ).fetchone()
@@ -247,10 +280,37 @@ class Store:
 
     def protect(self, account, gid, uid, expires, actor, now):
         with self.db:
-            self.db.execute(
-                "INSERT OR REPLACE INTO exemptions VALUES(?,?,?,?,?)", (account, gid, uid, expires, actor)
-            )
-            self._audit(now, account, gid, "保护", {"user": uid, "expires": expires, "actor": actor})
+            self._protect(account, gid, uid, expires, actor, now)
+
+    def _protect(self, account, gid, uid, expires, actor, now):
+        self.db.execute(
+            "INSERT OR REPLACE INTO exemptions VALUES(?,?,?,?,?)", (account, gid, uid, expires, actor)
+        )
+        self._audit(now, account, gid, "保护", {"user": uid, "expires": expires, "actor": actor})
+
+    def retain(self, account, gid, uid, actor, now):
+        # Resolve and protect atomically: cancellation/full disk cannot leave a reviewed
+        # operation without the permanent exemption promised to the administrator.
+        with self.db:
+            matched = [op for op in self.unresolved(account, gid) if op["uid"] == uid]
+            if not matched:
+                raise CleanerError("这个成员没有待核对的清理操作；需要普通保护请使用保护命令。")
+            self._protect(account, gid, uid, 0, actor, now)
+            for op in matched:
+                reason = f"管理员 {actor} 决定保留，不重发"
+                self.db.execute(
+                    "UPDATE operations SET state='reviewed_retained',reason=? WHERE id=?", (reason, op["id"])
+                )
+                self._audit(now, account, gid, "reviewed_retained", {"operation": op["id"], "reason": reason})
+
+    def clear_group_ban(self, account, gid, expected, actor, now):
+        with self.db:
+            key = f"ban-notice:{account}:{gid}:0"
+            if self.get(key, {}) != expected:
+                raise CleanerError("核验期间收到新的禁言状态，取消恢复，请重新检查。")
+            # Retain a timestamp to reject delayed notices older than this explicit review.
+            self._set(key, {"at": int(now), "active": False, "until": 0})
+            self._audit(now, account, gid, "管理员核验解除全员禁言", {"actor": actor})
 
     def unprotect(self, account, gid, uid, actor, now):
         with self.db:

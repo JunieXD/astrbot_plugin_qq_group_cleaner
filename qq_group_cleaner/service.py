@@ -90,11 +90,14 @@ class CleanerService:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def authorize(self, policy, actor, event_platform, event_account):
+        revision = self.settings().revision
         with read_priority(2):
             adapter = await self.router.resolve(policy)
             if adapter.platform_id != event_platform or adapter.account != event_account:
                 raise CleanerError("请私聊负责这个群的机器人账号。")
             allowed = await self.is_admin(adapter, policy.group_id, actor)
+        if self.settings().revision != revision or self.settings().group(policy.group_id) != policy:
+            raise CleanerError("授权期间配置已改变，请按当前配置重新操作。")
         if not allowed:
             raise CleanerError("只有这个群当前的群主或管理员可以操作和查看名单。")
         return adapter
@@ -127,11 +130,13 @@ class CleanerService:
         self.healthy()
         settings = self.settings()
         gid, account = policy.group_id, adapter.account
+        if settings.group(gid) != policy or (policy.bot_qq and policy.bot_qq != account):
+            raise CleanerError("检查前群配置或机器人绑定已改变，请重新检查。")
         if not await adapter.online():
             raise PlatformError("QQ 当前离线，暂缓检查。")
         binding = self.router.binding_stamp(adapter)
         info = await adapter.group(gid)
-        info.check_speaking(policy.protect_muted)
+        await self.check_speaking(policy, account, info)
         if policy.trigger > info.capacity:
             raise CleanerError("开始人数超过实际群容量，请调整这个群的配置。")
         triggered = await self.cycle(
@@ -151,7 +156,7 @@ class CleanerService:
             )
             return None
         info, members = await adapter.snapshot(gid)
-        info.check_speaking(policy.protect_muted)
+        await self.check_speaking(policy, account, info)
         # Recompute using the count belonging to the snapshot, not the earlier count.
         triggered = await self.cycle(
             policy,
@@ -251,6 +256,15 @@ class CleanerService:
         self.journal.record("计划已生成", payload["id"])
         return await self.store.call("plan", payload["id"])
 
+    async def check_speaking(self, policy, account, info):
+        info.check_speaking(policy.protect_muted)
+        if policy.protect_muted:
+            notice = await self.store.call("get", f"ban-notice:{account}:{policy.group_id}:0", {})
+            if notice.get("active"):
+                raise PlatformError(
+                    "已收到全员禁言通知，暂缓清理；若解除通知遗漏，确认解除后用“恢复”重新核验。"
+                )
+
     async def confirm(self, plan_id, policy, adapter, actor):
         self.healthy()
         settings = self.settings()
@@ -281,6 +295,24 @@ class CleanerService:
         if await self.store.call("get", "account-pause:" + account, ""):
             if await self.store.call("pause_owner", account) != gid:
                 raise CleanerError("账号因其他群的操作暂停，请由那个群的管理员核对后恢复。")
+        ban = await self.store.call("get", f"ban-notice:{account}:{gid}:0", {})
+        if ban.get("active"):
+            version = self.event_versions.get((account, gid, "0"), 0)
+            # A lift notice may have been lost while QQ/AstrBot was disconnected.
+            # Only an explicit administrator recovery can reconcile that persisted notice.
+            with read_priority(2):
+                adapter = await self.router.resolve(self.settings().group(gid))
+                if adapter.account != account:
+                    raise CleanerError("恢复期间机器人绑定改变，请重新操作。")
+                binding = self.router.binding_stamp(adapter)
+                (await adapter.group(gid)).check_speaking(True)
+                await self.sleep(2)
+                (await adapter.group(gid)).check_speaking(True)
+                if self.router.binding_stamp(adapter) != binding:
+                    raise CleanerError("恢复期间连接改变，请稍后重试。")
+                if self.event_versions.get((account, gid, "0"), 0) != version:
+                    raise CleanerError("恢复期间收到新的禁言状态，请重新检查。")
+            await self.store.call("clear_group_ban", account, gid, ban, actor, self.clock())
         await self.store.call("set", "pause:" + scope(account, gid), "")
         await self.store.call("set", "account-pause:" + account, "")
         await self.store.call("set", "cooldown:" + account, self.clock() + random.uniform(300, 900))
@@ -298,7 +330,8 @@ class CleanerService:
             return
         get = raw.get if isinstance(raw, dict) else lambda k, d=None: getattr(raw, k, d)
         account, gid, uid = (str(get(k, "")) for k in ("self_id", "group_id", "user_id"))
-        if not all(number(v) for v in (account, gid, uid)):
+        group_ban = get("post_type") == "notice" and get("notice_type") == "group_ban"
+        if not all(number(v) for v in (account, gid)) or not (number(uid) or (group_ban and uid == "0")):
             return
         try:
             policy = self.settings().group(gid)
@@ -311,23 +344,26 @@ class CleanerService:
             if get("post_type") == "message" and get("message_type") == "group"
             else get("notice_type")
         )
-        if kind not in ("message", "group_increase", "group_decrease", "group_admin"):
+        if kind not in ("message", "group_increase", "group_decrease", "group_admin", "group_ban"):
             return
         now = self.clock()
         occurred = number(get("time"))
         if not occurred or occurred > now + 300:
             self.failure = "收到时间异常的群事件，已暂停清理，请检查 NapCat 与系统时间。"
             return
+        duration = number(get("duration"), zero=True) if group_ban else 0
+        if group_ban and (get("sub_type") not in ("ban", "lift_ban") or duration is None):
+            self.failure = "收到无法识别的禁言通知，已暂停清理，请检查 NapCat。"
+            return
         key = (account, gid, uid)
         self.event_versions[key] = self.event_versions.get(key, 0) + 1
         if len(self.event_versions) > 100000:
             self.failure = "活动保护记录达到容量上限，请检查群配置后重载。"
             return
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                [account, gid, uid, kind, occurred, get("message_id"), get("operator_id"), get("sub_type")]
-            ).encode()
-        ).hexdigest()
+        identity = [account, gid, uid, kind, occurred, get("message_id"), get("operator_id"), get("sub_type")]
+        if group_ban:
+            identity.append(duration)
+        fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         try:
             await self.store.call(
                 "observe",
@@ -340,6 +376,7 @@ class CleanerService:
                 fingerprint,
                 str(get("operator_id", "")),
                 str(get("sub_type", "")),
+                duration,
             )
         except CleanerError as exc:
             self.failure = str(exc)

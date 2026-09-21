@@ -9,7 +9,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import CleanerError, Deferred, Policy
 from .rules import Member, number
@@ -40,6 +40,27 @@ class GroupInfo:
     def check_speaking(self, protect_muted):
         if protect_muted and self.all_muted is not False:
             raise PlatformError("群正在全员禁言或全员禁言状态未知，暂缓清理。")
+
+
+def merge_snapshot_evidence(first: Member, second: Member) -> Member:
+    """Preserve protective facts from both responses when NapCat's caches disagree."""
+    if first.joined != second.joined:
+        raise PlatformError("成员入群身份在两次查询之间变化，本次暂缓，等待名单稳定。")
+
+    def maximum_known(left, right):
+        return max(left, right) if left is not None and right is not None else None
+
+    return replace(
+        second,
+        last_sent=maximum_known(first.last_sent, second.last_sent),
+        activity=max(first.last_sent or 0, second.last_sent or 0),
+        role=first.role if first.role in ("owner", "admin") else second.role,
+        group_level=maximum_known(first.group_level, second.group_level),
+        qq_level=maximum_known(first.qq_level, second.qq_level),
+        title=(second.title or first.title) if first.title is not None and second.title is not None else None,
+        muted_until=maximum_known(first.muted_until, second.muted_until),
+        robot=first.robot or second.robot,
+    )
 
 
 class Adapter:
@@ -105,16 +126,24 @@ class Adapter:
                 await self.sleep(max(0, self.next_read - now))
                 self.reads.append(self.clock())
                 self.next_read = self.clock() + random.uniform(1.5, 3.0)
-            self.connection_stamp()
-            clients = self._connection_token()
-            if clients:
-                params["self_id"] = clients[0][
-                    0
-                ]  # Bind aiocqhttp routing explicitly, including private commands.
-            if before_send is not None:
-                before_send()
+
+            async def invoke():
+                self.connection_stamp()
+                clients = self._connection_token()
+                if clients:
+                    params["self_id"] = clients[0][0]  # Explicit aiocqhttp routing, also for commands.
+                # Recheck inside the transport task so notices already queued on the
+                # event loop can invalidate the write before transport actually starts.
+                if before_send is not None:
+                    before_send()
+                return await self.bot.call_action(action=action, **params)
+
             try:
-                result = await asyncio.wait_for(self.bot.call_action(action=action, **params), timeout=25)
+                # Explicit scheduling keeps this boundary identical on Python 3.10+;
+                # wait_for(coroutine) itself schedules differently across Python versions.
+                result = await asyncio.wait_for(asyncio.create_task(invoke()), timeout=25)
+            except CleanerError:
+                raise
             except Exception as exc:
                 if type(exc).__name__ in {
                     "NetworkError",
@@ -203,7 +232,8 @@ class Adapter:
         info = await self.group(gid)
         if {m.user_id for m in first} != {m.user_id for m in second} or len(second) != info.count:
             raise PlatformError("群人数或名单正在变化，本次暂缓，下一次重新检查。")
-        return info, second
+        previous = {m.user_id: m for m in first}
+        return info, [merge_snapshot_evidence(previous[m.user_id], m) for m in second]
 
     async def kick(self, gid, uid, *, before_send=None):
         return await self.call(

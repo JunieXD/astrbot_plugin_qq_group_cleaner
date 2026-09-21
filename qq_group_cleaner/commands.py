@@ -172,15 +172,7 @@ class Commands:
                 return "\n".join(results) + "\n核对不会重发移出请求。确认处理完毕后使用恢复命令。"
             if action == "保留":
                 uid = identifier(parts[2], "QQ号")
-                records = await s.store.call("unresolved", account, gid)
-                matched = [op for op in records if op["uid"] == uid]
-                if not matched:
-                    return "这个成员没有待核对的清理操作；需要普通保护请使用保护命令。"
-                for op in matched:
-                    await s.store.call(
-                        "result", op["id"], "reviewed_retained", f"管理员 {actor} 决定保留，不重发", s.clock()
-                    )
-                await s.store.call("protect", account, gid, uid, 0, actor, s.clock())
+                await s.store.call("retain", account, gid, uid, actor, s.clock())
                 return "已记为人工保留并加入永久保护名单，不会重发请求。处理完其他异常后可恢复本群。"
         return HELP
 
