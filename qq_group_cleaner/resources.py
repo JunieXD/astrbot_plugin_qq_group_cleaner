@@ -109,7 +109,7 @@ class Journal:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.handler = CheckedHandler(
             self.directory / "cleaner.log",
-            maxBytes=10 * 1024 * 1024,
+            maxBytes=20 * 1024 * 1024,
             backupCount=7,
             encoding="utf-8",
             delay=False,
@@ -119,7 +119,7 @@ class Journal:
         try:
             self.screening_handler = CheckedHandler(
                 self.directory / "screening.log",
-                maxBytes=10 * 1024 * 1024,
+                maxBytes=20 * 1024 * 1024,
                 backupCount=7,
                 encoding="utf-8",
                 delay=False,
@@ -199,10 +199,6 @@ class Journal:
             raise CleanerError("插件数据库超过容量上限，已停止清理，请检查并归档历史记录。")
 
     def maintain(self):
-        for name in ("cleaner.log", "screening.log"):
-            for path in self.directory.glob(name + ".*"):
-                if path.suffix[1:].isdigit() and path.stat().st_mtime < time.time() - 14 * 86400:
-                    path.unlink()
         self.check()
 
     def close(self):

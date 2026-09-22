@@ -531,18 +531,6 @@ class Store:
         ]
 
     def maintain(self, now):
-        with self.db:
-            self.db.execute("DELETE FROM events WHERE at<?", (now - 7 * 86400,))
-            self.db.execute("DELETE FROM audit WHERE at<?", (now - 180 * 86400,))
-            self.db.execute(
-                "DELETE FROM plans WHERE created<? AND id NOT IN (SELECT plan FROM operations)",
-                (now - 30 * 86400,),
-            )
-            # Keep every attempt for the current membership, including reviewed/uncertain attempts.
-            self.db.execute(
-                """DELETE FROM operations WHERE submitted<? AND state NOT IN ('unknown','submitted')
-                AND EXISTS (SELECT 1 FROM members m WHERE m.account=operations.account AND m.gid=operations.gid
-                AND m.uid=operations.uid AND m.epoch!=operations.epoch)""",
-                (now - 180 * 86400,),
-            )
+        # Preserve historical records for statistics, regardless of age or membership epoch.
+        # Checkpointing consolidates the WAL; it does not delete application history.
         self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import time
 from dataclasses import replace
 
@@ -41,6 +42,37 @@ async def test_retention_preserves_unresolved_operations_and_current_epoch_attem
     await env.store.call("result", operation, "reviewed_retained", "人工保留", env.clock())
     await env.store.call("maintain", env.clock() + 400 * 86400)
     assert (await env.store.call("operation", operation))["state"] == "reviewed_retained"
+
+
+async def test_maintenance_preserves_all_old_history(env):
+    database = env.path / "state.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.execute("INSERT INTO events VALUES ('old-event-for-statistics', 1)")
+        db.execute(
+            "INSERT INTO audit(at,account,gid,kind,detail) VALUES (1,?,?,?,?)",
+            (ACCOUNT, GROUP, "old-audit-for-statistics", "{}"),
+        )
+        for plan in ("old-unreferenced-plan", "old-referenced-plan"):
+            db.execute(
+                "INSERT INTO plans VALUES (?,?,?,1,2,'completed','{}',NULL)",
+                (plan, ACCOUNT, GROUP),
+            )
+        db.execute(
+            "INSERT INTO members VALUES (?,?,?,1,2,1,1,1)",
+            (ACCOUNT, GROUP, "old-membership-for-statistics"),
+        )
+        db.execute(
+            "INSERT INTO operations(plan,account,gid,uid,epoch,submitted,state,reason) "
+            "VALUES (?,?,?,?,1,1,'confirmed','old completed operation')",
+            ("old-referenced-plan", ACCOUNT, GROUP, "old-membership-for-statistics"),
+        )
+    tables = ("events", "audit", "plans", "operations")
+    with sqlite3.connect(database) as db:
+        before = {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
+    await env.store.call("maintain", env.clock() + 400 * 86400)
+    with sqlite3.connect(database) as db:
+        after = {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
+    assert after == before
 
 
 async def test_startup_delay_persistent_and_stop_cancels_scheduler(env):
@@ -87,8 +119,10 @@ def test_instance_lock_excludes_second_owner_and_releases(tmp_path):
     InstanceLock(path).close()
 
 
-def test_log_rotation_age_close_and_failure(tmp_path):
+def test_log_rotation_preserves_old_archives_and_checks_failure(tmp_path):
     journal = Journal(tmp_path)
+    assert journal.handler.maxBytes == journal.screening_handler.maxBytes == 20 * 1024 * 1024
+    assert journal.handler.backupCount == journal.screening_handler.backupCount == 7
     journal.handler.maxBytes = 120
     for i in range(30):
         journal.record("test", f"{i:02d} " + "x" * 60)
@@ -97,7 +131,7 @@ def test_log_rotation_age_close_and_failure(tmp_path):
     assert archive.exists()
     os.utime(archive, (time.time() - 15 * 86400,) * 2)
     journal.maintain()
-    assert not archive.exists()
+    assert archive.exists()
     journal.handler.handleError(None)
     with pytest.raises(CleanerError, match="日志"):
         journal.check()
