@@ -125,7 +125,7 @@ class Adapter:
             self.invalid_identity = True
             raise PlatformError("同一接入连接了多个 QQ，请为每个 QQ 使用独立接入。")
         if current == () and getattr(getattr(self.bot, "_api", None), "_http_api", None) is None:
-            raise PlatformError("NapCat 连接已断开，等待重新连接后再检查。")
+            raise Deferred("NapCat 尚未连接，等待连接就绪后再检查。", self.clock() + 30)
         if current and self.account and current[0][0] != self.account:
             self.invalid_identity = True
             raise PlatformError("接入的 QQ 身份已改变，请重载插件重新绑定。")
@@ -327,13 +327,14 @@ class Adapter:
 
 
 class Router:
-    def __init__(self, context, store=None, *, pace=Pace, journal=None):
+    def __init__(self, context, store=None, *, pace=Pace, journal=None, clock=time.time):
         self.context = context
         self.adapters = {}
         self.lock = asyncio.Lock()
         self.store = store
         self.pace = pace
         self.journal = journal
+        self.clock = clock
 
     async def persist_recovery(self):
         for adapter in self.adapters.values():
@@ -375,7 +376,12 @@ class Router:
                         adapter.begin_recovery()
                         await adapter.persist_recovery()
                     adapter = self.adapters[pid] = Adapter(
-                        pid, platform.bot, store=self.store, pace=self.pace, journal=self.journal
+                        pid,
+                        platform.bot,
+                        store=self.store,
+                        pace=self.pace,
+                        journal=self.journal,
+                        clock=self.clock,
                     )
                 try:
                     if (
@@ -395,8 +401,12 @@ class Router:
                     ):
                         raise
                 found.append(adapter)
+            if not found:
+                raise Deferred("QQ 接入尚未就绪，等待平台加载或连接恢复。", self.clock() + 30)
             if policy.bot_qq:
                 found = [a for a in found if a.account == policy.bot_qq]
+                if not found:
+                    raise PlatformError("未找到配置的机器人 QQ，请检查机器人 QQ 和对应接入是否已启用。")
             if len({a.account for a in found}) != len(found):
                 raise PlatformError("同一 QQ 接入了多个平台，请只保留一个接入后再使用清理。")
             if len(found) != 1:

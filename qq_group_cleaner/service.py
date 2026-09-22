@@ -153,7 +153,7 @@ class CleanerService:
         if settings.group(gid) != policy or (policy.bot_qq and policy.bot_qq != account):
             raise CleanerError("检查前群配置或机器人绑定已改变，请重新检查。")
         if not await adapter.online():
-            raise PlatformError("QQ 当前离线，暂缓检查。")
+            raise Deferred("QQ 当前离线，等待恢复后再检查。", self.clock() + 30)
         binding = self.router.binding_stamp(adapter)
         info = await adapter.group(gid)
         self.journal.record(
@@ -572,7 +572,7 @@ class CleanerService:
             await self._check_group(policy)
 
     async def _check_group(self, policy):
-        from .executor import Executor
+        from .executor import Executor, wait_message
 
         gid = policy.group_id
         async with self.group_lock(gid):
@@ -583,6 +583,11 @@ class CleanerService:
                 if not self.settings().enabled or not policy.enabled:
                     self.journal.record("群检查跳过", reason="总开关或群规则已关闭")
                     return
+                # AstrBot initializes plugins before loading platform connections.
+                # The persisted startup buffer applies to automatic reads as well as writes.
+                startup_until = await self.store.call("get", "startup_until", 0)
+                if self.clock() < startup_until:
+                    raise Deferred(wait_message("普通启动/重载缓冲", startup_until), startup_until)
                 adapter = await self.router.resolve(policy)
                 if await self.store.call(
                     "get", "account-pause:" + adapter.account, ""
