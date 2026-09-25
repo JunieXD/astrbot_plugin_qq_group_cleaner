@@ -411,6 +411,27 @@ class Store:
         ).fetchone()
         return row[0], row[1]
 
+    def quota_ready_at(self, account, gid, now, group_limit, account_limit):
+        rows = self.db.execute(
+            "SELECT gid,submitted FROM operations WHERE account=? AND submitted>? ORDER BY submitted",
+            (account, now - 86400),
+        ).fetchall()
+        account_times = [row["submitted"] for row in rows]
+        group_times = [row["submitted"] for row in rows if row["gid"] == gid]
+        deadlines = [now]
+        for times, limit in ((account_times, account_limit), (group_times, group_limit)):
+            if len(times) >= limit:
+                # A lowered limit may require several old attempts to expire, not just one.
+                deadlines.append(times[len(times) - limit] + 86400)
+        return max(deadlines)
+
+    def plan_outcomes(self, plan_id):
+        return dict(
+            self.db.execute(
+                "SELECT state,count(*) FROM operations WHERE plan=? GROUP BY state", (plan_id,)
+            ).fetchall()
+        )
+
     def reserve_read(self, platform, now, limit):
         with self.db:
             key = "reads:" + platform

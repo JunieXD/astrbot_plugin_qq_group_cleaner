@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import CleanerError
+from .config import CleanerError, Deferred
 
 _LOG_CONTEXT = ContextVar("qq_cleaner_log_context", default={})
 
@@ -150,6 +150,14 @@ class Journal:
             self.record(kind + "开始")
             try:
                 yield
+            except Deferred as exc:
+                self.record(
+                    kind + "等待",
+                    str(exc),
+                    retry_at=exc.until,
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                )
+                raise
             except BaseException as exc:
                 self.record(
                     kind + ("取消" if isinstance(exc, asyncio.CancelledError) else "失败"),
@@ -163,7 +171,10 @@ class Journal:
 
     def record(self, kind: str, detail: str = "", *, exception=None, screening=False, **fields):
         level = "INFO"
-        if exception is not None:
+        if isinstance(exception, Deferred):
+            fields.setdefault("reason", str(exception))
+            fields.setdefault("retry_at", exception.until)
+        elif exception is not None:
             level = "WARNING" if isinstance(exception, (CleanerError, asyncio.CancelledError)) else "ERROR"
             fields["exception"] = exception_detail(exception)
         payload = {

@@ -12,6 +12,11 @@ from .rules import Member, evaluate
 from .service import scope
 
 CHINA = timezone(timedelta(hours=8))
+MEMBER_BUDGET_SECONDS = 90
+
+
+class PlanTimeUnavailable(Deferred):
+    """A normal stop before another member can be processed within the deadline."""
 
 
 def wait_message(reason, until):
@@ -36,12 +41,49 @@ def in_window(now, pace):
     return hour >= pace.start_hour or hour < pace.end_hour
 
 
+def next_window(now, pace):
+    if in_window(now, pace):
+        return now
+    start = datetime.fromtimestamp(now, CHINA).replace(
+        hour=pace.start_hour, minute=0, second=0, microsecond=0
+    )
+    if start.timestamp() <= now:
+        start += timedelta(days=1)
+    return start.timestamp()
+
+
+def window_end(now, pace):
+    if pace.start_hour == pace.end_hour or (pace.start_hour == 0 and pace.end_hour == 24):
+        return float("inf")
+    midnight = datetime.fromtimestamp(now, CHINA).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = midnight + timedelta(hours=pace.end_hour)
+    if end.timestamp() <= now:
+        end += timedelta(days=1)
+    return end.timestamp()
+
+
+async def execution_wait(store, account, gid, now, pace, *, first=True, connection_until=0):
+    until, reason = await scheduled_wait(store, account, gid, first=first, connection_until=connection_until)
+    quota_until = await store.call(
+        "quota_ready_at", account, gid, now, pace.group_daily_limit, pace.account_daily_limit
+    )
+    if quota_until > max(now, until):
+        until, reason = quota_until, "最近24小时额度恢复"
+    opening = next_window(max(now, until), pace)
+    if opening > max(now, until):
+        until, reason = opening, "执行时段"
+    # Do not build a list just before closing when even the first member cannot fit.
+    if first and opening + pace.max_delay + MEMBER_BUDGET_SECONDS >= window_end(opening, pace):
+        until, reason = next_window(window_end(opening, pace), pace), "下一个完整执行时段"
+    return until, reason
+
+
 class Executor:
     def __init__(self, service):
         self.s = service
         self.store = service.store
 
-    async def gate(self, plan, *, first=False):
+    async def gate(self, plan, *, first=False, connection_until=0):
         s = self.s
         s.healthy()
         settings = s.settings()
@@ -52,8 +94,10 @@ class Executor:
             raise CleanerError("插件未启用或配置已变更，请重新预览。")
         if policy.bot_qq and policy.bot_qq != plan["account"]:
             raise CleanerError("群配置中的机器人绑定已改变，请重新预览。")
-        if plan["expires"] <= now or current["state"] not in ("ready", "running"):
-            raise CleanerError("计划已过期或停止，请重新预览。")
+        if current["state"] not in ("ready", "running"):
+            raise CleanerError("计划已停止，请重新预览。")
+        if plan["expires"] <= now:
+            await self.check_time_budget(plan, settings.pace, now)
         if policy.mode == "仅预览" or (policy.mode == "确认后清理" and not current["approver"]):
             raise CleanerError("当前模式或确认状态不允许执行。")
         key = scope(plan["account"], plan["gid"])
@@ -63,11 +107,17 @@ class Executor:
             raise CleanerError("此账号已暂停；请核对历史中的异常记录，再使用恢复命令。")
         if await self.store.call("unresolved_account", plan["account"]):
             raise CleanerError("存在结果不明的操作，需先核对或保留成员。")
-        until, reason = await scheduled_wait(self.store, plan["account"], plan["gid"], first=first)
+        until, reason = await execution_wait(
+            self.store,
+            plan["account"],
+            plan["gid"],
+            now,
+            settings.pace,
+            first=first,
+            connection_until=connection_until,
+        )
         if now < until:
             raise Deferred(wait_message(reason, until), until)
-        if not in_window(now, settings.pace):
-            raise Deferred("当前不在执行时段内。", now + 300)
         used_account, used_group = await self.store.call("quota", plan["account"], plan["gid"], now)
         s.journal.record(
             "执行额度核验",
@@ -76,33 +126,70 @@ class Executor:
             account_limit=settings.pace.account_daily_limit,
             group_limit=settings.pace.group_daily_limit,
         )
-        if used_group >= settings.pace.group_daily_limit or used_account >= settings.pace.account_daily_limit:
-            raise Deferred("最近 24 小时额度已用完，稍后检查。", now + 3600)
         return policy, settings
 
     async def execute(self, plan, adapter):
+        summary = {
+            "planned": len(plan["members"]),
+            "skipped": 0,
+            "outcome": "finished",
+            "reason": "本批处理完成",
+        }
         with self.s.journal.span("批次执行", plan=plan["id"], account=plan["account"], gid=plan["gid"]):
-            await self._execute_with_recovery(plan, adapter)
+            try:
+                await self._execute_with_recovery(plan, adapter, summary)
+            except BaseException as exc:
+                summary["outcome"] = (
+                    "waiting"
+                    if isinstance(exc, Deferred)
+                    else "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "failed"
+                )
+                summary["reason"] = str(exc) or "任务取消或插件关闭"
+                raise
+            finally:
+                try:
+                    states = await self.store.call("plan_outcomes", plan["id"])
+                    submitted = sum(states.values())
+                    removed = states.get("confirmed_removed", 0) + states.get("observed_absent", 0)
+                    self.s.journal.record(
+                        "批次结果",
+                        **summary,
+                        submitted=submitted,
+                        removed=removed,
+                        states=states,
+                        unresolved=states.get("submitted", 0) + states.get("unknown", 0),
+                        unprocessed=summary["planned"] - submitted - summary["skipped"],
+                    )
+                except CleanerError as exc:
+                    self.s.journal.record("批次结果读取失败", exception=exc, **summary)
 
-    async def _execute_with_recovery(self, plan, adapter):
+    async def _execute_with_recovery(self, plan, adapter, summary):
         try:
-            await self._execute(plan, adapter)
+            await self._execute(plan, adapter, summary)
         finally:
             if adapter.recovery_until:
                 await self.store.call(
                     "extend_deadline", "cooldown:" + adapter.account, adapter.recovery_until
                 )
 
-    async def _execute(self, plan, adapter):
+    async def _execute(self, plan, adapter, summary):
         s = self.s
         if (adapter.account, adapter.platform_id) != (plan["account"], plan["platform"]):
             raise CleanerError("机器人账号绑定已改变，请重新预览。")
         lock = s.account_locks.setdefault(adapter.account, asyncio.Lock())
         async with lock:
             self.check_binding(plan, adapter)
-            if adapter.recovery_until > s.clock():
-                raise Deferred(wait_message("连接恢复冷却", adapter.recovery_until), adapter.recovery_until)
-            policy, settings = await self.gate(plan, first=True)
+            policy, settings = await self.gate(plan, first=True, connection_until=adapter.recovery_until)
+            await self.check_time_budget(
+                plan,
+                settings.pace,
+                max(
+                    s.clock() + settings.pace.max_delay,
+                    await self.store.call("get", "write-at:" + adapter.account, 0),
+                ),
+            )
             await self.store.call("plan_state", plan["id"], "running")
             await self.store.call(
                 "set",
@@ -116,6 +203,7 @@ class Executor:
                         await self.store.call("get", "write-at:" + adapter.account, 0),
                         s.clock() + random.uniform(settings.pace.min_delay, settings.pace.max_delay),
                     )
+                    await self.check_time_budget(plan, settings.pace, ready_at)
                     await self.store.call("set", "write-at:" + adapter.account, ready_at)
                     s.journal.record(
                         "成员操作等待",
@@ -130,8 +218,14 @@ class Executor:
                     guard = s.router.shared_guard()
 
                     async def action():
-                        with read_priority(1), s.journal.span("成员处理", user=item["member"]["user_id"]):
-                            return await self.one(plan, adapter, Member(**item["member"]))
+                        try:
+                            with read_priority(1), s.journal.span("成员处理", user=item["member"]["user_id"]):
+                                return await self.one(plan, adapter, Member(**item["member"]))
+                        except Deferred as exc:
+                            # Scheduling/read-budget waits are not platform failures.
+                            if guard is None or isinstance(exc, guard.deferred_error):
+                                raise
+                            raise guard.deferred_error(str(exc)) from exc
 
                     async def online():
                         with read_priority(1):
@@ -156,8 +250,13 @@ class Executor:
                                 key=None,  # Our SQLite intent is the durable source of truth.
                             )
                         except guard.deferred_error as exc:
+                            if isinstance(exc, Deferred):
+                                raise
+                            if isinstance(exc.__cause__, Deferred):
+                                raise exc.__cause__
                             raise Deferred("共享操作队列正在冷却，稍后重新检查。", s.clock() + 3600) from exc
                     if result == "stop":
+                        summary["reason"] = "群人数已达到目标"
                         s.journal.record(
                             "批次提前结束",
                             reason="群人数已达到目标",
@@ -168,10 +267,12 @@ class Executor:
                             ],
                         )
                         break
+                    if result == "skip":
+                        summary["skipped"] += 1
                     completed.add(item["member"]["user_id"])
             except BaseException as exc:
                 s.journal.record(
-                    "批次中断",
+                    "批次暂缓" if isinstance(exc, Deferred) else "批次中断",
                     exception=exc,
                     remaining=[
                         item["member"]["user_id"]
@@ -184,6 +285,26 @@ class Executor:
             finally:
                 # Cancellation still completes the DB write via Store.call's shield.
                 await self.store.call("plan_state", plan["id"], "finished")
+
+    async def check_time_budget(self, plan, pace, ready_at):
+        end = window_end(self.s.clock(), pace)
+        if ready_at + MEMBER_BUDGET_SECONDS < min(plan["expires"], end):
+            return
+        await self.store.call("plan_state", plan["id"], "cancelled")
+        until = next_window(end, pace) if end <= plan["expires"] else self.s.clock() + 15
+        reason = (
+            "执行时段剩余时间不足，等待下个时段"
+            if end <= plan["expires"]
+            else "名单剩余有效时间不足，需重新预览或生成计划"
+        )
+        self.s.journal.record(
+            "停止开始下一名成员",
+            reason=reason,
+            ready_at=ready_at,
+            expires=plan["expires"],
+            reserve_seconds=MEMBER_BUDGET_SECONDS,
+        )
+        raise PlanTimeUnavailable(reason, until)
 
     def check_binding(self, plan, adapter):
         if self.s.router.binding_stamp(adapter) != plan.get("binding"):
@@ -209,6 +330,7 @@ class Executor:
     async def one(self, plan, adapter, original):
         s, gid, account = self.s, plan["gid"], adapter.account
         policy, settings = await self.gate(plan)
+        await self.check_time_budget(plan, settings.pace, s.clock())
         current_plan = await self.store.call("plan", plan["id"])
         actors = {original.user_id, account}
         if policy.protect_muted:

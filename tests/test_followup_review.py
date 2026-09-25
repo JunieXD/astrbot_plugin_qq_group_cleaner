@@ -8,7 +8,7 @@ from conftest import ACCOUNT, ADMIN, GROUP
 from test_platform import Bot
 
 from qq_group_cleaner.commands import Commands
-from qq_group_cleaner.config import CleanerError
+from qq_group_cleaner.config import CleanerError, Deferred
 from qq_group_cleaner.executor import Executor
 from qq_group_cleaner.platform import Adapter
 from qq_group_cleaner.rules import Member, evaluate
@@ -142,7 +142,9 @@ async def test_missing_group_unban_can_be_reconciled_only_by_explicit_resume(env
         await env.service.resume(ACCOUNT, GROUP, ADMIN)
     env.adapter.all_muted = False
     await env.service.resume(ACCOUNT, GROUP, ADMIN)
-    assert await env.service.build_plan(env.policy, env.adapter)
+    with pytest.raises(Deferred, match="恢复冷却"):
+        await env.service.build_plan(env.policy, env.adapter)
+    assert await env.service.build_plan(env.policy, env.adapter, manual=True)
     assert await env.store.call("get", "cooldown:" + ACCOUNT) > env.clock()
 
 

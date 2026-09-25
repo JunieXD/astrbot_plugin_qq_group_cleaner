@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime
 
 from .config import identifier, integer
-from .executor import CHINA, Executor, scheduled_wait, wait_message
+from .executor import CHINA, Executor, execution_wait, scheduled_wait, wait_message
 from .platform import read_priority
 from .rules import evaluate
 from .service import scope
@@ -225,12 +225,17 @@ class Commands:
                 account_pause["reason"] if account_pause.get("gid") == gid else "账号因其他群的操作暂停"
             )
         check_error = await s.store.call("get", "check-error:" + gid, "")
+        wait_status = await s.store.call("get", "wait-status:" + gid, {})
+        if wait_status.get("revision") != settings.revision:
+            wait_status = {}
         unresolved = await s.store.call("unresolved", account, gid)
         used_account, used_group = await s.store.call("quota", account, gid, s.clock())
-        waiting_until, waiting_reason = await scheduled_wait(
+        waiting_until, waiting_reason = await execution_wait(
             s.store,
             account,
             gid,
+            s.clock(),
+            settings.pace,
             connection_until=adapter.recovery_until,
         )
         latest = await s.store.call("latest", account, gid)
@@ -248,8 +253,13 @@ class Commands:
             )
         if waiting_until > s.clock():
             lines.append(wait_message(waiting_reason, waiting_until) + "仍需满足执行时段和额度。")
-        if s.failure or group_pause or account_pause or check_error:
+        if s.failure or group_pause or account_pause or (check_error and not wait_status):
             lines.append("暂停原因：" + (s.failure or group_pause or account_pause or check_error))
+        elif wait_status:
+            if wait_status.get("until", float("inf")) <= s.clock():
+                lines.append("状态：等待时间已到，等待重新核验执行条件。")
+            else:
+                lines.append("状态：" + wait_status["reason"])
         else:
             lines.append("状态：" + status.get("text", "等待检查"))
         lines.append("与其他插件共享操作队列。" if s.router.shared_guard() else "操作节奏仅覆盖本插件。")

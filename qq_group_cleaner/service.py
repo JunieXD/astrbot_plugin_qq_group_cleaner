@@ -51,6 +51,7 @@ class CleanerService:
         self.workers = {}
         self.wake = asyncio.Event()
         self.next_check = {}
+        self.settings_revision = self.settings().revision
         self.command_next = {}
         self.last_clock = (self.clock(), self.monotonic())
 
@@ -190,6 +191,19 @@ class CleanerService:
                 {"at": self.clock(), "count": info.count, "text": "人数未达到开始线"},
             )
             return None
+        if not manual and settings.enabled and policy.enabled and policy.mode != "仅预览":
+            from .executor import execution_wait, wait_message
+
+            until, reason = await execution_wait(
+                self.store, account, gid, self.clock(), settings.pace, connection_until=adapter.recovery_until
+            )
+            if until > self.clock():
+                await self.store.call(
+                    "set",
+                    "status:" + scope(account, gid),
+                    {"at": self.clock(), "count": info.count, "text": wait_message(reason, until)},
+                )
+                raise Deferred(wait_message(reason, until), until)
         info, members = await adapter.snapshot(gid)
         self.journal.record(
             "一致成员名单已取得",
@@ -576,6 +590,7 @@ class CleanerService:
 
         gid = policy.group_id
         async with self.group_lock(gid):
+            plan = None
             try:
                 self.healthy()
                 # A job may have waited for a concurrent command; use the current policy.
@@ -597,17 +612,74 @@ class CleanerService:
                     raise CleanerError("本群已由管理员暂停。")
                 plan = await self.store.call("latest", adapter.account, gid)
                 ready = plan and plan["state"] == "ready" and plan["expires"] > self.clock()
-                if not ready:
+                if policy.mode == "确认后清理" and plan:
+                    if plan["revision"] != self.settings().revision or plan["expires"] <= self.clock():
+                        if plan["state"] in ("ready", "pending"):
+                            await self.store.call("plan_state", plan["id"], "cancelled")
+                        ready = False
+                        text = "确认名单已过期或配置改变，请重新预览并确认。"
+                    else:
+                        text = (
+                            "等待管理员确认本批名单。"
+                            if plan["state"] == "pending"
+                            else "本批已结束，请重新预览并确认。"
+                        )
+                    if not ready:
+                        self.journal.record("等待人工确认", plan=plan["id"], reason=text)
+                        await self.store.call("set", "check-error:" + gid, "")
+                        await self.store.call(
+                            "set",
+                            "wait-status:" + gid,
+                            {"reason": text, "revision": self.settings().revision},
+                        )
+                        self.next_check[gid] = (
+                            min(self.clock() + 1800, plan["expires"])
+                            if plan["state"] == "pending" and plan["expires"] > self.clock()
+                            else self.clock() + 1800
+                        )
+                        return
+                if policy.mode == "自动清理" or not ready:
                     plan = await self.build_plan(policy, adapter)
+                next_execution = None
                 if plan and plan["state"] == "ready":
                     await Executor(self).execute(plan, adapter)
+                    if policy.mode == "自动清理":
+                        from .executor import execution_wait
+
+                        next_execution, _ = await execution_wait(
+                            self.store,
+                            adapter.account,
+                            gid,
+                            self.clock(),
+                            self.settings().pace,
+                            connection_until=adapter.recovery_until,
+                        )
+                await self.store.call("set", "wait-status:" + gid, {})
+                await self.store.call("set", "check-error:" + gid, "")
                 self.next_check[gid] = self.clock() + random.uniform(1800, 2100)
+                if next_execution is not None:
+                    self.next_check[gid] = min(self.next_check[gid], max(self.clock() + 1, next_execution))
                 self.journal.record("下次检查已安排", retry_at=self.next_check[gid])
             except Deferred as exc:
-                self.next_check[gid] = max(self.clock() + 15, exc.until)
+                self.next_check[gid] = max(
+                    self.clock() + 1, min(exc.until, self.clock() + random.uniform(1800, 2100))
+                )
+                if (
+                    policy.mode == "确认后清理"
+                    and plan
+                    and plan["state"] == "ready"
+                    and plan["expires"] > self.clock()
+                ):
+                    self.next_check[gid] = min(self.next_check[gid], plan["expires"])
                 await self.store.call("set", "check-error:" + gid, str(exc))
-                self.journal.record("等待执行", str(exc), exception=exc, retry_at=self.next_check[gid])
+                await self.store.call(
+                    "set",
+                    "wait-status:" + gid,
+                    {"reason": str(exc), "until": exc.until, "revision": self.settings().revision},
+                )
+                self.journal.record("等待执行", str(exc), retry_at=exc.until, next_check=self.next_check[gid])
             except CleanerError as exc:
+                await self.store.call("set", "wait-status:" + gid, {})
                 self.journal.record("检查暂缓", str(exc), exception=exc, retry_at=self.clock() + 3600)
                 await self.store.call("set", "check-error:" + gid, str(exc))
                 self.next_check[gid] = self.clock() + 3600
@@ -615,6 +687,11 @@ class CleanerService:
     def dispatch(self):
         # At most four groups work concurrently. Account locks still serialize removals.
         # Oldest due groups come first, so a large group cannot monopolize every budget window.
+        revision = self.settings().revision
+        if revision != self.settings_revision:
+            self.settings_revision = revision
+            self.next_check.clear()
+            self.journal.record("配置变更，重新计算调度时间", revision=revision)
         for gid, task in list(self.workers.items()):
             if task.done():
                 if not task.cancelled() and task.exception():
@@ -635,6 +712,7 @@ class CleanerService:
                 and self.next_check.get(gid, 0) <= self.clock()
             ):
                 self.workers[gid] = asyncio.create_task(self.check_group(policy), name="qq-cleaner-group")
+                self.workers[gid].add_done_callback(lambda task: self.wake.set())
 
     async def loop(self):
         maintenance_at = 0
@@ -655,6 +733,8 @@ class CleanerService:
                 self.failure = "插件遇到内部异常，已停止清理，请查看日志并重载。"
                 self.journal.record("内部异常", exception=exc)
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=15)
+                now = self.clock()
+                upcoming = [at - now for at in self.next_check.values() if at > now]
+                await asyncio.wait_for(self.wake.wait(), timeout=min(15, *upcoming) if upcoming else 15)
             except asyncio.TimeoutError:
                 pass

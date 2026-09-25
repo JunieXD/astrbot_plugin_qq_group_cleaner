@@ -16,7 +16,7 @@ from .qq_group_cleaner.service import CleanerService
 from .qq_group_cleaner.store import Store
 
 
-@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.2.4")
+@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.2.5")
 class QQGroupCleaner(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context=context, config=config)
@@ -46,7 +46,7 @@ class QQGroupCleaner(Star):
             )
             await self.service.start()
             self.start_error = ""
-            logger.info("QQ 群清理 v0.2.4 已加载；默认只预览，配置中启用后开始检查。")
+            logger.info("QQ 群清理 v0.2.5 已加载；默认只预览，配置中启用后开始检查。")
         except BaseException as exc:
             if self.journal:
                 self.journal.record("插件初始化失败", exception=exc)
