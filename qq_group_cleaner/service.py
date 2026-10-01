@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, replace
 
-from .config import CleanerError, Deferred, Policy
+from .config import CleanerError, CommandPermissionError, Deferred, Policy
 from .platform import PlatformError, read_priority
 from .rules import evaluate, number
 
@@ -113,7 +113,7 @@ class CleanerService:
         if self.settings().revision != revision or self.settings().group(policy.group_id) != policy:
             raise CleanerError("授权期间配置已改变，请按当前配置重新操作。")
         if not allowed:
-            raise CleanerError("只有这个群当前的群主或管理员可以操作和查看名单。")
+            raise CommandPermissionError("只有这个群当前的群主或管理员可以操作和查看名单。")
         return adapter
 
     async def is_admin(self, adapter, gid, uid):

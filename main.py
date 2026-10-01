@@ -8,8 +8,9 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .qq_group_cleaner.command_access import CommandAccess
 from .qq_group_cleaner.commands import Commands
-from .qq_group_cleaner.config import CleanerError, parse_settings
+from .qq_group_cleaner.config import CleanerError, CommandPermissionError, parse_settings
 from .qq_group_cleaner.platform import Router
 from .qq_group_cleaner.resources import InstanceLock, Journal, exception_detail
 from .qq_group_cleaner.service import CleanerService
@@ -26,6 +27,7 @@ class QQGroupCleaner(Star):
         self.journal = None
         self.lock = None
         self.start_error = "插件尚未初始化。"
+        self.command_access = CommandAccess()
 
     def settings(self):
         return parse_settings(dict(self.raw_config))
@@ -100,24 +102,39 @@ class QQGroupCleaner(Star):
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def cleaner_command(self, event):
         event.stop_event()
+        bot_admin = bool(event.is_admin())
         service = self.service
         if not service:
-            yield event.plain_result(self.start_error or "插件正在停止，请稍后重试。")
+            if bot_admin:
+                yield event.plain_result(self.start_error or "插件正在停止，请稍后重试。")
             return
         task = asyncio.current_task()
         service.jobs.add(task)
+        response_authorized = bot_admin
         try:
             raw = getattr(event.message_obj, "raw_message", None)
             self_id = (
                 str(raw.get("self_id", "")) if isinstance(raw, dict) else str(getattr(raw, "self_id", ""))
             )
+            if not await self.command_access.allowed(
+                service, text=event.get_message_str(), actor=str(event.get_sender_id()),
+                platform=str(event.platform_meta.id), account=self_id, bot_admin=bot_admin,
+            ):
+                return
+            response_authorized = True
             result = await Commands(service).run(
                 event.get_message_str(), str(event.get_sender_id()), str(event.platform_meta.id), self_id
             )
+        except CommandPermissionError:
+            return
         except CleanerError as exc:
+            if not response_authorized:
+                return
             result = str(exc)
         except Exception as exc:
             service.journal.record("命令异常", exception=exc)
+            if not response_authorized:
+                return
             result = "操作未完成，请查看插件状态和日志。"
         finally:
             service.jobs.discard(task)

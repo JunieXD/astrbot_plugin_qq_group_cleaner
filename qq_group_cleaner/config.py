@@ -12,6 +12,10 @@ class CleanerError(Exception):
     """Safe, actionable text suitable for the administrator (no API payloads)."""
 
 
+class CommandPermissionError(CleanerError):
+    """Unverified command callers must not receive a chat response."""
+
+
 class Deferred(CleanerError):
     def __init__(self, message: str, until: float):
         super().__init__(message)
