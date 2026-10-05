@@ -9,7 +9,7 @@ from .config import identifier, integer
 from .executor import CHINA, Executor, execution_wait, scheduled_wait, wait_message
 from .platform import read_priority
 from .rules import evaluate
-from .service import scope
+from .service import population_summary, scope
 
 HELP = """群清理：先在插件配置中添加群，默认仅预览。
 私聊使用（把“群号”换成实际群号）：
@@ -240,10 +240,14 @@ class Commands:
             connection_until=adapter.recovery_until,
         )
         latest = await s.store.call("latest", account, gid)
+        cycle = await s.store.call("get", "cycle:" + key, {})
+        cycle_active = cycle.get("revision") == settings.revision and cycle.get("expires", 0) > s.clock()
+        population = population_summary(policy, status.get("count"), cycle_active=cycle_active)
         lines = [
             f"群 {gid} · {policy.mode} · {'已启用' if settings.enabled and policy.enabled else '未启用'}",
-            f"达到 {policy.trigger} 人开始，降到 {policy.target} 人停止。",
+            f"人数规则：达到 {policy.trigger} 人启动本轮，启动后降到 {policy.target} 人停止。",
             f"最近检查：{date_text(status['at']) if status else '尚未检查'}；人数：{status.get('count', '未知')}。",
+            "人数条件：" + population["reason"],
             f"{policy.inactive_days} 天未发言；新成员保护 {policy.newcomer_days} 天；{policy.order}。",
             f"最近24小时已提交：本群 {used_group}/{settings.pace.group_daily_limit}，账号 {used_account}/{settings.pace.account_daily_limit}。",
             f"本群待核对：{len(unresolved)} 条。",

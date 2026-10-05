@@ -20,6 +20,35 @@ def scope(account, gid):
     return f"{account}:{gid}"
 
 
+def population_summary(policy, count, *, cycle_active=False):
+    """Explain the existing start/stop rules without changing the cleanup cycle."""
+    gap = max(0, policy.trigger - count) if count is not None else None
+    remaining = max(0, count - policy.target) if count is not None else None
+    active = bool(cycle_active and count is not None and count > policy.target)
+    if count is None:
+        reason = "尚未取得人数，暂时无法判断距离启动线还有多少人。"
+    elif active:
+        reason = (
+            f"本轮人数条件已触发，距 {policy.target} 人停止线还需减少 {remaining} 人；"
+            f"本轮无需再次达到 {policy.trigger} 人。"
+        )
+    elif count >= policy.trigger:
+        reason = (
+            f"已达到 {policy.trigger} 人启动线，距启动后 {policy.target} 人停止线还需减少 {remaining} 人。"
+        )
+    else:
+        reason = f"本轮尚未触发：最近检查 {count} 人，距离 {policy.trigger} 人启动线还差 {gap} 人。"
+    return {
+        "count": count,
+        "trigger": policy.trigger,
+        "target": policy.target,
+        "gap_to_trigger": gap,
+        "remaining_to_target": remaining,
+        "cycle_active": active,
+        "reason": reason,
+    }
+
+
 class CleanerService:
     def __init__(
         self,
@@ -168,14 +197,19 @@ class CleanerService:
         await self.check_speaking(policy, account, info)
         if policy.trigger > info.capacity:
             raise CleanerError("开始人数超过实际群容量，请调整这个群的配置。")
-        triggered = await self.cycle(
+        cycle_active = await self.cycle(
             policy,
             account,
             info.count,
             settings.revision,
             settings.enabled and policy.enabled and policy.mode != "仅预览",
         )
-        triggered = triggered or info.count >= policy.trigger
+        triggered = cycle_active or info.count >= policy.trigger
+        self.journal.record(
+            "人数条件判断",
+            source="群详情",
+            **population_summary(policy, info.count, cycle_active=cycle_active),
+        )
         if not triggered and not manual:
             self.journal.record(
                 "本次不生成名单",
@@ -214,14 +248,19 @@ class CleanerService:
         )
         await self.check_speaking(policy, account, info)
         # Recompute using the count belonging to the snapshot, not the earlier count.
-        triggered = await self.cycle(
+        cycle_active = await self.cycle(
             policy,
             account,
             info.count,
             settings.revision,
             settings.enabled and policy.enabled and policy.mode != "仅预览",
         )
-        triggered = triggered or info.count >= policy.trigger
+        triggered = cycle_active or info.count >= policy.trigger
+        self.journal.record(
+            "人数条件判断",
+            source="一致成员名单",
+            **population_summary(policy, info.count, cycle_active=cycle_active),
+        )
         members = await self.store.call("merge", account, gid, members, self.clock())
         protected, attempted = await self.store.call("exclusions", account, gid, self.clock())
         cache_key = "qq-cache:" + scope(account, gid)
