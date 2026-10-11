@@ -301,6 +301,30 @@ async def test_shared_guard_uses_platform_key_and_revalidates_after_its_wait(env
     assert not env.adapter.kicks
 
 
+async def test_cleanup_long_interval_is_not_applied_to_shared_account_gap(env):
+    from dataclasses import replace
+    calls = []
+    pace = replace(env.box.settings.pace, min_delay=60, max_delay=60,
+                   account_gap_min_seconds=8, account_gap_max_seconds=15)
+    env.box.settings = replace(env.box.settings, pace=pace)
+
+    class Guard:
+        scheduling_version = 4
+        deferred_error = Deferred
+
+        async def run(self, **kwargs):
+            calls.append((env.clock(), kwargs))
+            return await kwargs["action"]()
+
+    env.router.guard = Guard()
+    await run(env)
+    assert len(calls) == 3
+    assert all(kwargs["gap"] == (8, 15) and kwargs["priority"] == 2
+               and kwargs["group"] == GROUP and kwargs["label"] == "清理群成员"
+               for _, kwargs in calls)
+    assert all(b[0] - a[0] >= 60 for a, b in zip(calls, calls[1:]))
+
+
 async def test_cancellation_after_sent_recovers_unknown_on_restart(env):
     entered = asyncio.Event()
 

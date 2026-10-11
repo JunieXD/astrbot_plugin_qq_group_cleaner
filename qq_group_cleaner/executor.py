@@ -235,6 +235,9 @@ class Executor:
                         result = await action()
                     else:
                         try:
+                            options = {}
+                            if getattr(guard, "scheduling_version", 1) >= 3:
+                                options = dict(priority=2, group=policy.group_id, label="清理群成员")
                             result = await guard.run(
                                 account=adapter.platform_id,
                                 online=online,
@@ -246,8 +249,13 @@ class Executor:
                                     "failure_cooldown_seconds": 3600,
                                 },
                                 delay=(0, 0),
-                                gap=(settings.pace.min_delay, settings.pace.max_delay),
+                                # min/max_delay already reserve this cleaner's
+                                # own next operation outside the shared guard.
+                                # Only the common account gap blocks approvals.
+                                gap=(settings.pace.account_gap_min_seconds,
+                                     settings.pace.account_gap_max_seconds),
                                 key=None,  # Our SQLite intent is the durable source of truth.
+                                **options,
                             )
                         except guard.deferred_error as exc:
                             if isinstance(exc, Deferred):

@@ -111,3 +111,8 @@ QQ 不提供阅读/潜水时长、完整历史贡献或可靠的“从未发言�
 - [虚构配置示例](examples/policies.json)
 
 开发验证：`uv sync --locked --group dev`，然后运行 `uv run pytest -q` 和 `uv run ruff check .`。测试使用模拟适配器，不连接真实 QQ。
+
+
+### 与其他 QQ 插件共享操作队列
+
+清群每两次移出成员的等待仍由 `pace.min_delay` / `pace.max_delay` 控制，只约束清群自身的预约。在共享账号队列中使用独立的 `account_gap_min_seconds` / `account_gap_max_seconds`（默认 8–15 秒，范围 1–120），避免清群的长等待拖住后续加群审批；同账号写操作仍互斥，并保留在线检查和恢复冷却。任务标记为「清理群成员」，加群审批可优先执行，长期等待的清群任务仍会逐步获得调度机会。

@@ -69,3 +69,13 @@ def test_per_group_isolation_and_revision_change():
     assert settings.group("100002").inactive_days == 60
     assert settings.group("100003").inactive_days == 180
     assert settings.revision != parse_settings({}).revision
+
+
+@pytest.mark.parametrize("values", [
+    {"account_gap_min_seconds": 0},
+    {"account_gap_max_seconds": 121},
+    {"account_gap_min_seconds": 20, "account_gap_max_seconds": 10},
+])
+def test_invalid_shared_account_gap_is_rejected(values):
+    with pytest.raises(CleanerError):
+        parse_settings({"pace": values})

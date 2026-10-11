@@ -92,6 +92,8 @@ class Policy:
 class Pace:
     min_delay: int = 30
     max_delay: int = 90
+    account_gap_min_seconds: int = 8
+    account_gap_max_seconds: int = 15
     batch_size: int = 5
     group_daily_limit: int = 20
     account_daily_limit: int = 30
@@ -221,6 +223,8 @@ def parse_settings(raw: dict) -> Settings:
         "recovery_max_seconds": (30, 3600),
         "min_delay": (10, 600),
         "max_delay": (10, 600),
+        "account_gap_min_seconds": (1, 120),
+        "account_gap_max_seconds": (1, 120),
         "batch_size": (1, 10),
         "group_daily_limit": (1, 100),
         "account_daily_limit": (1, 100),
@@ -235,6 +239,8 @@ def parse_settings(raw: dict) -> Settings:
         "recovery_max_seconds": "连接或异常恢复最长冷却秒数",
         "min_delay": "最短等待秒数",
         "max_delay": "最长等待秒数",
+        "account_gap_min_seconds": "共享账号操作最短间隔秒数",
+        "account_gap_max_seconds": "共享账号操作最长间隔秒数",
         "batch_size": "每批人数",
         "group_daily_limit": "每群每日上限",
         "account_daily_limit": "每账号每日上限",
@@ -250,6 +256,8 @@ def parse_settings(raw: dict) -> Settings:
     )
     if pace.min_delay > pace.max_delay:
         raise CleanerError("最短等待不能大于最长等待。")
+    if pace.account_gap_min_seconds > pace.account_gap_max_seconds:
+        raise CleanerError("共享账号操作最短间隔不能大于最长间隔。")
     for kind, label in (("startup", "普通启动/重载缓冲"), ("recovery", "连接或异常恢复冷却")):
         if getattr(pace, kind + "_min_seconds") > getattr(pace, kind + "_max_seconds"):
             raise CleanerError(f"{label}：最短等待不能大于最长等待。")

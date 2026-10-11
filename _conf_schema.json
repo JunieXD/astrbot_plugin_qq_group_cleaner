@@ -79,6 +79,8 @@
       "batch_minutes": {"description": "两批至少间隔几分钟", "type": "int", "default": 60, "hint": "30～1440分钟，每群分别计算。"},
       "min_delay": {"description": "每人操作前最短等待秒数", "type": "int", "default": 30, "hint": "10～600秒，每次随机抽取。"},
       "max_delay": {"description": "每人操作前最长等待秒数", "type": "int", "default": 90, "hint": "不能小于最短等待，最多600秒。"},
+      "account_gap_min_seconds": {"description": "共享账号操作最短间隔（秒）", "type": "int", "default": 8, "hint": "范围 1–120 秒。应用于同账号插件共享操作队列；清群自身的两次移出间隔仍使用最短/最长等待，避免将清群长间隔传递给加群审批。"},
+      "account_gap_max_seconds": {"description": "共享账号操作最长间隔（秒）", "type": "int", "default": 15, "hint": "范围 1–120 秒。应用于同账号插件共享操作队列；清群自身的两次移出间隔仍使用最短/最长等待，避免将清群长间隔传递给加群审批。"},
       "startup_min_seconds": {"description": "普通启动/重载最短缓冲秒数", "type": "int", "default": 30, "hint": "0～600秒；与最长值之间随机抽取。只影响普通启动或保存配置后的重载，不影响恢复冷却和批次间隔。两项都填0可关闭这项缓冲。"},
       "startup_max_seconds": {"description": "普通启动/重载最长缓冲秒数", "type": "int", "default": 90, "hint": "不能小于最短值，最多600秒。默认普通重载只缓冲30～90秒。"},
       "recovery_min_seconds": {"description": "连接或异常恢复最短冷却秒数", "type": "int", "default": 300, "hint": "30～3600秒；检测到断线重连、网络异常或使用恢复命令时生效。默认300～900秒，即5～15分钟。异常暂停仍需人工处理，不会到时自动解除。"},
