@@ -28,6 +28,8 @@
             "hint": "必须小于开始人数。分批腾出空间；符合条件的人不足时不会放宽规则。"},
           "inactive_days": {"description": "至少多少天未发言才可清理", "type": "int", "default": 90,
             "hint": "至少7天。使用QQ群提供的最后发言时间，并以插件观察到的近期活动补充保护。读取、潜水不能识别。"},
+          "require_invalid_card": {"description": "只清理群名片不合规的成员", "type": "bool", "default": false,
+            "hint": "打开后，名片不合规且达到上方未发言天数，才可能进入清理名单。自动沿用“QQ群名片规范”插件中同一群的正则、忽略空白和大小写设置，无需重复填写。名片合规或资料缺失时保留；找不到规则或正则异常时停止清理。"},
           "newcomer_days": {"description": "新成员保护多少天", "type": "int", "default": 30,
             "hint": "至少7天。在群时间不足的成员受到保护，即使平台发言时间很早。"},
           "order": {"description": "先清理谁", "type": "string", "default": "最久未发言优先",

@@ -83,6 +83,33 @@ async def test_invalid_configuration_has_useful_error_and_no_background_tasks(en
     assert "停止人数" in plugin.start_error
 
 
+async def test_entry_reads_the_card_guard_source_and_rejects_a_missing_source(entry, monkeypatch):
+    plugin_cls, _ = entry
+    module = sys.modules[plugin_cls.__module__]
+    source = {"groups": [{"group_id": "100002", "pattern": r"23-\w+"}]}
+    monkeypatch.setattr(module, "read_card_guard_config", lambda path: source)
+    plugin = plugin_cls(
+        SimpleNamespace(platform_manager=SimpleNamespace(get_insts=lambda: [])),
+        {"groups": [{"group_id": "100002", "require_invalid_card": True}]},
+    )
+    await plugin.initialize()
+    try:
+        assert plugin.service is not None
+        first = plugin.settings()
+        assert first.group("100002").card_rule.pattern == r"23-\w+"
+        source["groups"][0]["pattern"] = r"24-\w+"
+        assert plugin.settings().revision != first.revision
+
+        def missing(path):
+            raise module.CardRuleError("无法读取名片规范插件配置")
+
+        monkeypatch.setattr(module, "read_card_guard_config", missing)
+        with pytest.raises(module.CleanerError, match="无法读取"):
+            plugin.settings()
+    finally:
+        await plugin.terminate()
+
+
 async def test_private_help_responds_without_network_or_llm(entry):
     plugin_cls, _ = entry
     plugin = plugin_cls(SimpleNamespace(platform_manager=SimpleNamespace(get_insts=lambda: [])), {})
@@ -142,7 +169,6 @@ async def test_log_close_failure_does_not_leak_instance_lock(entry):
     assert released == [True] and plugin.lock is None
 
 
-
 @pytest.mark.parametrize("admin", [False, True])
 async def test_startup_error_is_visible_only_to_bot_administrators(entry, admin):
     plugin_cls, _ = entry
@@ -153,15 +179,18 @@ async def test_startup_error_is_visible_only_to_bot_administrators(entry, admin)
     assert [result async for result in command(event)] == (["service unavailable"] if admin else [])
 
 
-@pytest.mark.parametrize("text,allowed,expected", [
-    ("{command}", False, []),
-    ("{command} 帮助", False, []),
-    ("{command} 错误 无效群号", False, []),
-    ("{command} 状态 100002", False, []),
-    ("{command} 帮助 100002", True, ["admin result"]),
-    ("{command} 状态 100002", True, ["admin result"]),
-    ("{command} 错误 100002", True, ["admin result"]),
-])
+@pytest.mark.parametrize(
+    "text,allowed,expected",
+    [
+        ("{command}", False, []),
+        ("{command} 帮助", False, []),
+        ("{command} 错误 无效群号", False, []),
+        ("{command} 状态 100002", False, []),
+        ("{command} 帮助 100002", True, ["admin result"]),
+        ("{command} 状态 100002", True, ["admin result"]),
+        ("{command} 错误 100002", True, ["admin result"]),
+    ],
+)
 async def test_command_entry_authorizes_before_help_or_errors(entry, monkeypatch, text, allowed, expected):
     plugin_cls, _ = entry
     module = sys.modules[plugin_cls.__module__]
@@ -189,13 +218,19 @@ async def test_command_entry_authorizes_before_help_or_errors(entry, monkeypatch
 
     monkeypatch.setattr(module, "Commands", Commands)
     plugin.service = SimpleNamespace(
-        jobs=set(), clock=lambda: 100, settings=lambda: SimpleNamespace(group=group),
-        authorize=authorize, journal=SimpleNamespace(record=lambda *a, **kw: None),
+        jobs=set(),
+        clock=lambda: 100,
+        settings=lambda: SimpleNamespace(group=group),
+        authorize=authorize,
+        journal=SimpleNamespace(record=lambda *a, **kw: None),
     )
     event = SimpleNamespace(
-        stop_event=lambda: None, is_admin=lambda: False, plain_result=lambda value: value,
+        stop_event=lambda: None,
+        is_admin=lambda: False,
+        plain_result=lambda value: value,
         message_obj=SimpleNamespace(raw_message={"self_id": "100001"}),
-        get_message_str=lambda: text.format(command=name), get_sender_id=lambda: "100003",
+        get_message_str=lambda: text.format(command=name),
+        get_sender_id=lambda: "100003",
         platform_meta=SimpleNamespace(id="test-platform"),
     )
     command = plugin.card_command if hasattr(plugin, "card_command") else plugin.cleaner_command
@@ -210,20 +245,27 @@ async def test_permission_revocation_during_command_is_silent(entry, monkeypatch
     plugin_cls, _ = entry
     module = sys.modules[plugin_cls.__module__]
     plugin = plugin_cls(SimpleNamespace(), {})
+
     async def allowed(*args, **kwargs):
         return True
+
     class Commands:
         def __init__(self, service):
             pass
+
         async def run(self, *args):
             raise module.CommandPermissionError("permission was revoked")
+
     monkeypatch.setattr(module, "Commands", Commands)
     plugin.command_access.allowed = allowed
     plugin.service = SimpleNamespace(jobs=set(), journal=SimpleNamespace(record=lambda *a, **kw: None))
     event = SimpleNamespace(
-        stop_event=lambda: None, is_admin=lambda: False, plain_result=lambda value: value,
+        stop_event=lambda: None,
+        is_admin=lambda: False,
+        plain_result=lambda value: value,
         message_obj=SimpleNamespace(raw_message={"self_id": "100001"}),
-        get_message_str=lambda: "状态 100002", get_sender_id=lambda: "100003",
+        get_message_str=lambda: "状态 100002",
+        get_sender_id=lambda: "100003",
         platform_meta=SimpleNamespace(id="test-platform"),
     )
     command = plugin.card_command if hasattr(plugin, "card_command") else plugin.cleaner_command

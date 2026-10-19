@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
+from .cards import CardRuleError
 from .config import CleanerError, Policy
 
 DAY = 86400
@@ -36,6 +37,7 @@ class Member:
     activity: float = 0
     epoch: int = 0
     membership_known: bool = True
+    card: str | None = None
 
     @classmethod
     def from_api(cls, raw: dict) -> Member:
@@ -49,7 +51,15 @@ class Member:
             title=raw.get("title") if isinstance(raw.get("title"), str) else None,
             muted_until=number(raw.get("shut_up_timestamp"), zero=True),
             robot=raw.get("is_robot") is True,
+            card=raw.get("card") if isinstance(raw.get("card"), str) else None,
         )
+
+
+def member_data(member, policy):
+    result = asdict(member)
+    if policy.card_rule is None:
+        result["card"] = None
+    return result
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,14 @@ def evaluate(
     days = int((now - last_active) / DAY)
     if days < policy.inactive_days:
         return keep(f"最近活动距今 {max(0, days)} 天，未达到 {policy.inactive_days} 天")
+    if policy.card_rule is not None:
+        if not isinstance(member.card, str) or len(member.card) > 512:
+            return keep("群名片资料缺失、变化或长度异常，保留")
+        try:
+            if policy.card_rule.matches(member.card):
+                return keep("群名片符合规范")
+        except CardRuleError as exc:
+            raise CleanerError(str(exc)) from exc
     if policy.protect_title and member.title is None:
         return keep("专属头衔信息缺失")
     if policy.protect_title and member.title:
@@ -146,6 +164,8 @@ def evaluate(
         fields = [f for f in policy.sort_fields if not (defer_qq and f == "qq_level")]
         key = tuple(values[f] for f in fields) + (int(member.user_id),)
     details = [f"{days} 天未发言"]
+    if policy.card_rule is not None:
+        details.append("群名片不符合规范")
     if score is not None:
         details.insert(0, f"综合得分 {score:.1f}/100")
     if policy.needs_group_level:

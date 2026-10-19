@@ -60,6 +60,7 @@ def merge_snapshot_evidence(first: Member, second: Member) -> Member:
         title=(second.title or first.title) if first.title is not None and second.title is not None else None,
         muted_until=maximum_known(first.muted_until, second.muted_until),
         robot=first.robot or second.robot,
+        card=second.card if first.card == second.card else None,
     )
 
 

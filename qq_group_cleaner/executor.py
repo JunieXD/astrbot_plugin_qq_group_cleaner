@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from .config import CleanerError, Deferred
 from .platform import read_priority
-from .rules import Member, evaluate
+from .rules import Member, evaluate, member_data
 from .service import scope
 
 CHINA = timezone(timedelta(hours=8))
@@ -252,8 +252,10 @@ class Executor:
                                 # min/max_delay already reserve this cleaner's
                                 # own next operation outside the shared guard.
                                 # Only the common account gap blocks approvals.
-                                gap=(settings.pace.account_gap_min_seconds,
-                                     settings.pace.account_gap_max_seconds),
+                                gap=(
+                                    settings.pace.account_gap_min_seconds,
+                                    settings.pace.account_gap_max_seconds,
+                                ),
                                 key=None,  # Our SQLite intent is the durable source of truth.
                                 **options,
                             )
@@ -333,7 +335,7 @@ class Executor:
         for actor in versions:
             key = (adapter.account, plan["gid"], actor)
             if s.event_versions.get(key, 0) != versions[actor]:
-                raise CleanerError("核验期间出现发言或身份变化，本次跳过。")
+                raise CleanerError("核验期间出现发言、身份变化或名片变化，本次跳过。")
 
     async def one(self, plan, adapter, original):
         s, gid, account = self.s, plan["gid"], adapter.account
@@ -374,8 +376,8 @@ class Executor:
         )
         s.journal.record(
             "执行前复核",
-            original=original.__dict__,
-            current=fresh.__dict__,
+            original=member_data(original, policy),
+            current=member_data(fresh, policy),
             eligible=decision.eligible,
             reason=decision.reason,
             score=decision.score,

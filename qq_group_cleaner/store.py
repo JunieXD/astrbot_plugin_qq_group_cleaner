@@ -163,7 +163,7 @@ class Store:
             self._audit(now, account, gid, kind, detail)
 
     def _clear_notices_before_join(self, account, gid, uid, joined):
-        for prefix in ("role-notice", "ban-notice"):
+        for prefix in ("role-notice", "ban-notice", "card-notice"):
             key = f"{prefix}:{account}:{gid}:{uid}"
             notice = self.get(key, {})
             if joined > notice.get("at", 0):
@@ -224,6 +224,10 @@ class Store:
                 muted = member.muted_until
                 if muted is not None:
                     muted = max(muted, ban_notice.get("until", 0))
+                card = member.card
+                card_notice = self.get(f"card-notice:{account}:{gid}:{member.user_id}", {})
+                if card_notice and card_notice.get("epoch") == epoch and card != card_notice.get("card"):
+                    card = None  # A newer notice must not be undone by an older API cache.
                 result.append(
                     replace(
                         member,
@@ -232,12 +236,24 @@ class Store:
                         membership_known=known,
                         role=role,
                         muted_until=muted,
+                        card=card,
                     )
                 )
         return result
 
     def observe(
-        self, account, gid, uid, kind, occurred, received, fingerprint, operator="", subtype="", duration=0
+        self,
+        account,
+        gid,
+        uid,
+        kind,
+        occurred,
+        received,
+        fingerprint,
+        operator="",
+        subtype="",
+        duration=0,
+        card=None,
     ):
         confirmed = []
         with self.db:
@@ -263,6 +279,19 @@ class Store:
             activity = row["activity"] if row else 0
             event_at = row["event_at"] if row else 0
             present = row["present"] if row else 1
+            if kind == "group_card":
+                key = f"card-notice:{account}:{gid}:{uid}"
+                previous = self.get(key, {})
+                if occurred >= previous.get("at", 0):
+                    self._set(
+                        key,
+                        {
+                            "at": occurred,
+                            "epoch": epoch,
+                            "card": card if isinstance(card, str) and len(card) <= 512 else None,
+                        },
+                    )
+                return {"reason": "名片变化证据已保存，旧缓存不用于清理", "confirmed_operations": []}
             if kind in ("message", "group_increase", "group_admin"):
                 activity = max(activity, occurred, received)  # late notices still protect
             if kind in ("group_increase", "group_decrease") and occurred >= event_at:

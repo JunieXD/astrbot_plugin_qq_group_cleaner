@@ -62,6 +62,8 @@ def render_plan(plan):
         lines.append(
             f"按综合得分由高到低排序；权重：未发言 {weights['inactive']} / 群等级 {weights['group_level']} / QQ等级 {weights['qq_level']}。"
         )
+    if plan.get("policy", {}).get("card_rule"):
+        lines.append("附加条件：群名片不符合名片规范插件的同群规则，且满足未活跃天数要求。")
     label = "资料已齐且符合条件" if plan["waiting"] else "符合条件"
     lines.append(f"{label} {plan['eligible']} 人，本批名单 {len(plan['members'])} 人：")
     for item in plan["members"]:
@@ -252,6 +254,10 @@ class Commands:
             f"最近24小时已提交：本群 {used_group}/{settings.pace.group_daily_limit}，账号 {used_account}/{settings.pace.account_daily_limit}。",
             f"本群待核对：{len(unresolved)} 条。",
         ]
+        if policy.card_rule:
+            lines.append("附加条件：只考虑群名片不合规的人；沿用名片规范插件的同群规则。")
+            if policy.card_rule.format_help:
+                lines.append("名片要求：" + policy.card_rule.format_help)
         if latest:
             lines.append(
                 f"最近计划：{latest['id']}，候选 {latest['eligible']} 人，待补资料 {latest['waiting']} 人。"

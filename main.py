@@ -8,6 +8,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .qq_group_cleaner.cards import CardRuleError, read_card_guard_config
 from .qq_group_cleaner.command_access import CommandAccess
 from .qq_group_cleaner.commands import Commands
 from .qq_group_cleaner.config import CleanerError, CommandPermissionError, parse_settings
@@ -17,7 +18,7 @@ from .qq_group_cleaner.service import CleanerService
 from .qq_group_cleaner.store import Store
 
 
-@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.2.7")
+@register("astrbot_plugin_qq_group_cleaner", "JunieXD", "按群容量和不活跃规则清理成员", "0.2.8")
 class QQGroupCleaner(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context=context, config=config)
@@ -30,7 +31,18 @@ class QQGroupCleaner(Star):
         self.command_access = CommandAccess()
 
     def settings(self):
-        return parse_settings(dict(self.raw_config))
+        raw = dict(self.raw_config)
+        source = None
+        rows = raw.get("groups", [])
+        if isinstance(rows, list) and any(
+            isinstance(row, dict) and row.get("require_invalid_card") is True for row in rows
+        ):
+            path = StarTools.get_data_dir("astrbot_plugin_qq_group_cleaner").parent.parent
+            try:
+                source = read_card_guard_config(path / "config" / "astrbot_plugin_qq_card_guard_config.json")
+            except CardRuleError as exc:
+                raise CleanerError(str(exc)) from exc
+        return parse_settings(raw, card_guard_config=source)
 
     async def initialize(self):
         try:
@@ -48,7 +60,7 @@ class QQGroupCleaner(Star):
             )
             await self.service.start()
             self.start_error = ""
-            logger.info("QQ 群清理 v0.2.7 已加载；默认只预览，配置中启用后开始检查。")
+            logger.info("QQ 群清理 v0.2.8 已加载；默认只预览，配置中启用后开始检查。")
         except BaseException as exc:
             if self.journal:
                 self.journal.record("插件初始化失败", exception=exc)
@@ -117,8 +129,12 @@ class QQGroupCleaner(Star):
                 str(raw.get("self_id", "")) if isinstance(raw, dict) else str(getattr(raw, "self_id", ""))
             )
             if not await self.command_access.allowed(
-                service, text=event.get_message_str(), actor=str(event.get_sender_id()),
-                platform=str(event.platform_meta.id), account=self_id, bot_admin=bot_admin,
+                service,
+                text=event.get_message_str(),
+                actor=str(event.get_sender_id()),
+                platform=str(event.platform_meta.id),
+                account=self_id,
+                bot_admin=bot_admin,
             ):
                 return
             response_authorized = True

@@ -13,7 +13,7 @@ from dataclasses import asdict, replace
 
 from .config import CleanerError, CommandPermissionError, Deferred, Policy
 from .platform import PlatformError, read_priority
-from .rules import evaluate, number
+from .rules import evaluate, member_data, number
 
 
 def scope(account, gid):
@@ -275,7 +275,7 @@ class CleanerService:
                     "成员初筛",
                     screening=True,
                     user=member.user_id,
-                    member=asdict(member),
+                    member=member_data(member, policy),
                     excluded=excluded,
                     eligible=preliminary.eligible,
                     reason=preliminary.reason,
@@ -366,7 +366,7 @@ class CleanerService:
                 "成员筛选",
                 screening=True,
                 user=member.user_id,
-                member=asdict(member),
+                member=member_data(member, policy),
                 evaluated_at=evaluated_at,
                 excluded=excluded,
                 eligible=decision.eligible,
@@ -403,7 +403,7 @@ class CleanerService:
             "reasons": dict(reasons),
             "policy": asdict(policy),
             "members": [
-                {"member": asdict(m), "reason": decision.reason, "score": decision.score}
+                {"member": member_data(m, policy), "reason": decision.reason, "score": decision.score}
                 for _, m, decision in selected
             ],
         }
@@ -527,7 +527,16 @@ class CleanerService:
             if get("post_type") == "message" and get("message_type") == "group"
             else get("notice_type")
         )
-        if kind not in ("message", "group_increase", "group_decrease", "group_admin", "group_ban"):
+        if kind not in (
+            "message",
+            "group_increase",
+            "group_decrease",
+            "group_admin",
+            "group_ban",
+            "group_card",
+        ):
+            return
+        if kind == "group_card" and policy.card_rule is None:
             return
         now = self.clock()
         occurred = number(get("time"))
@@ -567,6 +576,9 @@ class CleanerService:
         identity = [account, gid, uid, kind, occurred, get("message_id"), get("operator_id"), get("sub_type")]
         if group_ban:
             identity.append(duration)
+        card = get("card_new") if kind == "group_card" else None
+        if kind == "group_card":
+            identity.append(card if isinstance(card, str) else None)
         fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         try:
             outcome = await self.store.call(
@@ -581,6 +593,7 @@ class CleanerService:
                 str(get("operator_id", "")),
                 str(get("sub_type", "")),
                 duration,
+                card,
             )
             self.journal.record(
                 "群事件处理",

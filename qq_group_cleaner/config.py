@@ -7,6 +7,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .cards import CardRule, CardRuleError, rule_for_group
+
 
 class CleanerError(Exception):
     """Safe, actionable text suitable for the administrator (no API payloads)."""
@@ -68,6 +70,7 @@ class Policy:
     protect_muted: bool = True
     bot_qq: str = ""
     score_weights: ScoreWeights = field(default_factory=ScoreWeights)
+    card_rule: CardRule | None = None
 
     @property
     def sort_fields(self) -> tuple[str, ...]:
@@ -147,7 +150,7 @@ def boolean(raw: dict, key: str, default: bool) -> bool:
     return value
 
 
-def parse_settings(raw: dict) -> Settings:
+def parse_settings(raw: dict, *, card_guard_config=None) -> Settings:
     groups = []
     rows = raw.get("groups", [])
     if not isinstance(rows, list) or len(rows) > 30:
@@ -184,6 +187,12 @@ def parse_settings(raw: dict) -> Settings:
                 raise CleanerError("自定义顺序可填：" + "、".join(SORT_FIELDS))
             if len(set(custom)) != len(custom) or (order == "自定义" and not custom):
                 raise CleanerError("自定义顺序不能重复，选择自定义时至少填写一项。")
+            card_rule = None
+            if boolean(row, "require_invalid_card", False):
+                try:
+                    card_rule = rule_for_group(card_guard_config, gid)
+                except CardRuleError as exc:
+                    raise CleanerError(str(exc)) from exc
             protected = row.get("protected_users", [])
             if not isinstance(protected, list) or len(protected) > 2000:
                 raise CleanerError("保护名单应为 QQ 号列表，最多 2000 人。")
@@ -205,6 +214,7 @@ def parse_settings(raw: dict) -> Settings:
                 protect_muted=boolean(advanced, "protect_muted", True),
                 bot_qq=identifier(advanced.get("bot_qq", ""), "机器人 QQ", optional=True),
                 score_weights=weights,
+                card_rule=card_rule,
             )
             if policy.target >= policy.trigger:
                 raise CleanerError("停止人数必须小于开始人数。")
