@@ -111,6 +111,7 @@ class Store:
                 "UPDATE operations SET state='unknown',reason='插件在操作提交后中断' WHERE state='submitted'"
             )
             self.db.execute("UPDATE plans SET state='cancelled' WHERE state IN ('ready','running','pending')")
+        self.repair_legacy_empty_batches(time.time())
         if self.journal:
             for op in interrupted:
                 self.journal.record(
@@ -124,6 +125,33 @@ class Store:
                     reason="插件在提交后中断，需人工核对，不重发",
                 )
             self.journal.record("启动时作废旧计划", plans=[row["id"] for row in old_plans])
+
+    def repair_legacy_empty_batches(self, now):
+        """Old code reserved before waiting. Release only a provably unused legacy slot."""
+        released = []
+        with self.db:
+            rows = self.db.execute("SELECT key,value FROM state WHERE key LIKE 'batch:%'").fetchall()
+            for row in rows:
+                key, until = row["key"], json.loads(row["value"])
+                account, gid = key[len("batch:") :].split(":", 1)
+                if until <= now or self.get("batch-owner:" + account + ":" + gid, None) is not None:
+                    continue
+                # Configured batch intervals cannot exceed 24 hours. Any retained
+                # intent, including unknown/retained outcomes, prevents this repair.
+                used = self.db.execute(
+                    "SELECT 1 FROM operations WHERE account=? AND gid=? AND submitted>=? LIMIT 1",
+                    (account, gid, now - 86400),
+                ).fetchone()
+                if used:
+                    continue
+                self._set(key, 0)
+                detail = {"previous_until": until, "reason": "旧版空批次预约，最近24小时无提交记录"}
+                self._audit(now, account, gid, "释放旧版空批次间隔", detail)
+                released.append({"account": account, "gid": gid, **detail})
+        if self.journal:
+            for detail in released:
+                self.journal.record("释放旧版空批次间隔", **detail)
+        return released
 
     def close_db(self):
         if hasattr(self, "db"):
@@ -497,7 +525,7 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    def reserve(self, plan_id, member, now, group_limit, account_limit):
+    def reserve(self, plan_id, member, now, group_limit, account_limit, batch_seconds=None):
         """Intent, attempt quota and uniqueness commit together BEFORE the network write."""
         with self.db:
             plan = self.plan(plan_id)
@@ -527,6 +555,13 @@ class Store:
                 raise CleanerError("成员身份或活动已变化，取消本次提交。")
             if member.user_id in self.exclusions(account, gid, now)[0]:
                 raise CleanerError("成员刚被加入保护名单，取消本次提交。")
+            first = not self.db.execute(
+                "SELECT 1 FROM operations WHERE plan=? LIMIT 1", (plan_id,)
+            ).fetchone()
+            batch_key = "batch:" + account + ":" + gid
+            previous_until = self.get(batch_key, 0)
+            if batch_seconds is not None and first and previous_until > now:
+                raise Deferred("本群仍在等待上一批的间隔。", previous_until)
             try:
                 cursor = self.db.execute(
                     """INSERT INTO operations(plan,account,gid,uid,epoch,submitted,state,reason)
@@ -535,6 +570,20 @@ class Store:
                 )
             except sqlite3.IntegrityError as exc:
                 raise CleanerError("这个成员本次入群已经有操作记录，不会重复提交。") from exc
+            if batch_seconds is not None and first:
+                until = now + batch_seconds
+                self._set(batch_key, until)
+                self._set(
+                    "batch-owner:" + account + ":" + gid,
+                    {"plan": plan_id, "until": until, "previous_until": previous_until},
+                )
+                self._audit(
+                    now,
+                    account,
+                    gid,
+                    "批次间隔生效",
+                    {"plan": plan_id, "operation": cursor.lastrowid, "until": until},
+                )
             self._audit(
                 now,
                 account,
@@ -554,6 +603,22 @@ class Store:
                 now, op["account"], op["gid"], "发送前取消", {"operation": operation_id, "user": op["uid"]}
             )
             self.db.execute("DELETE FROM operations WHERE id=? AND state='submitted'", (operation_id,))
+            owner_key = "batch-owner:" + op["account"] + ":" + op["gid"]
+            owner = self.get(owner_key, {})
+            batch_key = "batch:" + op["account"] + ":" + op["gid"]
+            if (
+                owner.get("plan") == op["plan"]
+                and self.get(batch_key, 0) == owner.get("until")
+                and not self.db.execute(
+                    "SELECT 1 FROM operations WHERE plan=? LIMIT 1", (op["plan"],)
+                ).fetchone()
+            ):
+                self._set(batch_key, owner["previous_until"])
+                self.db.execute("DELETE FROM state WHERE key=?", (owner_key,))
+                detail = {"plan": op["plan"], "operation": operation_id, "reason": "本批意图均证实未发送"}
+                self._audit(now, op["account"], op["gid"], "释放空批次间隔", detail)
+                if self.journal:
+                    self.journal.record("释放空批次间隔", account=op["account"], gid=op["gid"], **detail)
 
     def result(self, operation_id, state, reason, now):
         with self.db:

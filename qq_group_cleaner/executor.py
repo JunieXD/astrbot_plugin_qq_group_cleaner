@@ -191,11 +191,6 @@ class Executor:
                 ),
             )
             await self.store.call("plan_state", plan["id"], "running")
-            await self.store.call(
-                "set",
-                "batch:" + scope(adapter.account, policy.group_id),
-                s.clock() + settings.pace.batch_minutes * 60,
-            )
             completed = set()
             try:
                 for item in plan["members"]:
@@ -432,9 +427,9 @@ class Executor:
             s.clock(),
             settings.pace.group_daily_limit,
             settings.pace.account_daily_limit,
+            settings.pace.batch_minutes * 60,
         )
         sent = False
-        s.journal.record("写前意图已保存", operation=operation_id, user=fresh.user_id)
 
         def before_send():
             nonlocal sent
@@ -442,6 +437,12 @@ class Executor:
             sent = True
 
         try:
+            s.journal.record(
+                "写前意图已保存",
+                operation=operation_id,
+                user=fresh.user_id,
+                batch_until=await self.store.call("get", "batch:" + scope(account, gid), 0),
+            )
             await adapter.kick(gid, fresh.user_id, before_send=before_send)
         except BaseException as exc:
             s.journal.record(

@@ -709,7 +709,7 @@ class CleanerService:
                 await self.store.call("set", "wait-status:" + gid, {})
                 await self.store.call("set", "check-error:" + gid, "")
                 self.next_check[gid] = self.clock() + random.uniform(1800, 2100)
-                if next_execution is not None:
+                if next_execution is not None and next_execution > self.clock():
                     self.next_check[gid] = min(self.next_check[gid], max(self.clock() + 1, next_execution))
                 self.journal.record("下次检查已安排", retry_at=self.next_check[gid])
             except Deferred as exc:
