@@ -68,11 +68,17 @@ class FakeAdapter:
         self.snapshot_calls = 0
         self.all_muted = False
         self.recovery_until = 0
+        self.generation = 0
+        self.was_online = True
 
     async def identity(self):
         return self.account
 
     async def online(self):
+        # Like the real adapter, a change of online state starts a new generation.
+        if self.connected != self.was_online:
+            self.generation += 1
+        self.was_online = self.connected
         return self.connected
 
     async def group(self, gid):

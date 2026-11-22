@@ -127,11 +127,17 @@ async def test_disconnected_write_is_not_sent_or_retried():
     assert not bot.calls
 
 
-async def test_qq_offline_check_retries_soon_without_removing_members(env):
+async def test_qq_offline_check_looks_again_soon_then_waits_recovery_cooldown(env):
     env.adapter.connected = False
+    pace = env.box.settings.pace
+    # Just dropped: a brief blip should not add a long wait before the recovery cooldown.
+    await env.service.check_group(env.policy)
+    assert env.service.next_check[GROUP] == env.clock() + 30
+    # Still offline: wait as long as the recovery cooldown instead of spending the read budget.
+    env.clock.now += 30
     now = env.clock()
     await env.service.check_group(env.policy)
-    assert env.service.next_check[GROUP] == now + 30
+    assert now + pace.recovery_min_seconds <= env.service.next_check[GROUP] <= now + pace.recovery_max_seconds
     assert "QQ 当前离线" in await env.store.call("get", "check-error:" + GROUP)
     assert not env.adapter.kicks
     assert not env.adapter.snapshot_calls

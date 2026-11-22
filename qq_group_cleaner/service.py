@@ -182,8 +182,17 @@ class CleanerService:
         gid, account = policy.group_id, adapter.account
         if settings.group(gid) != policy or (policy.bot_qq and policy.bot_qq != account):
             raise CleanerError("检查前群配置或机器人绑定已改变，请重新检查。")
+        generation = adapter.generation
         if not await adapter.online():
-            raise Deferred("QQ 当前离线，等待恢复后再检查。", self.clock() + 30)
+            # Look again soon after QQ drops, so a brief blip is not followed by a long wait and then
+            # the recovery cooldown; while it stays offline, 30-second checks would spend the read budget.
+            pace = settings.pace
+            wait = (
+                30
+                if adapter.generation != generation
+                else random.uniform(pace.recovery_min_seconds, pace.recovery_max_seconds)
+            )
+            raise Deferred("QQ 当前离线，等待恢复后再检查。", self.clock() + wait)
         binding = self.router.binding_stamp(adapter)
         info = await adapter.group(gid)
         self.journal.record(

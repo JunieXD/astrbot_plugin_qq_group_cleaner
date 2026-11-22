@@ -96,6 +96,19 @@ async def test_read_budget_and_status():
         await api.online()
 
 
+async def test_only_a_change_of_online_state_starts_a_new_generation():
+    status = {"online": False}
+    api = adapter({"get_status": lambda: dict(status)})
+    generation = api.generation
+    assert not await api.online()
+    assert api.generation == generation + 1
+    assert not await api.online()
+    assert api.generation == generation + 1
+    status["online"] = True
+    assert await api.online()
+    assert api.generation == generation + 2
+
+
 @pytest.mark.parametrize("raw, expected", [(-1, True), (0, False), (None, None)])
 async def test_napcat_group_mute_mapping_and_string_identifiers(raw, expected):
     api = adapter(
